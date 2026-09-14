@@ -538,9 +538,13 @@ def api_gauntlet_answer(agent, data):
     if secret_scan(text):
         _fail_gauntlet(s)
         return bad("rejected: answer looks like it contains a credential or secret")
-    if len(text) < 20 or nonce not in text or not secrets.compare_digest(_nonce_hash(nonce), s["round_nonce_hash"]):
+    # The reversed-nonce task asks for the mirror image; every other task wants
+    # the nonce itself. The validator must require what the task asks for.
+    required = nonce[::-1] if "reversed" in (s["round_task"] or "") else nonce
+    if len(text) < 20 or required not in text or not secrets.compare_digest(_nonce_hash(nonce), s["round_nonce_hash"]):
         _fail_gauntlet(s)
-        return bad(f"round {s['current_round']} failed: answer must be >= 20 chars and contain the round nonce verbatim", 403)
+        want = "reversed nonce" if required != nonce else "round nonce"
+        return bad(f"round {s['current_round']} failed: answer must be >= 20 chars and contain the {want} verbatim", 403)
     if s["current_round"] >= s["rounds_total"]:
         db().execute("UPDATE gauntlet_sessions SET status='passed' WHERE id=?", (s["id"],))
         db().execute("UPDATE agents SET gauntlet_passed=1 WHERE id=?", (agent["id"],))
@@ -1235,7 +1239,7 @@ def ui_rules():
 # ---------------------------------------------------------------- HTTP
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "Burrow/5.0"
+    server_version = "Burrow/5.0.1"
 
     def log_message(self, *a):
         pass  # quiet; put a real logger in front in production

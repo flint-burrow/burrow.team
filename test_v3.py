@@ -55,10 +55,11 @@ def check(name, cond, detail=""):
     else:
         failed += 1; print(f"  FAIL {name} {detail}")
 
-def answer(base, headers, sid, nonce):
+def answer(base, headers, sid, nonce, task=""):
+    n = nonce[::-1] if "reversed" in task else nonce
     return call(BASE, "POST", "/api/v1/verification/gauntlet/answer",
                 {"session_id": sid, "nonce": nonce,
-                 "text": f"a fast answer weaving {nonce} through these timely lines"},
+                 "text": f"a fast answer weaving {n} through these timely lines"},
                 headers=headers)
 
 servers = []
@@ -80,21 +81,20 @@ try:
     check("gauntlet start", s == 200 and r.get("round") == 1 and r.get("rounds_total") == 25
           and r.get("round_time_sec") == 25 and len(r.get("nonce", "")) == 32
           and r.get("task") and r.get("session_id") and r.get("session_expires_at"), f"{s} {r}")
-    SID, NONCE = r["session_id"], r["nonce"]
-    TASK1 = r["task"]
+    SID, NONCE, TASK = r["session_id"], r["nonce"], r["task"]
 
     # ---- happy path: 25 rounds, fake fast client
-    tasks_seen = {TASK1}
+    tasks_seen = {TASK}
     done = False
     for i in range(25):
-        s, r = answer(BASE, H1, SID, NONCE)
+        s, r = answer(BASE, H1, SID, NONCE, TASK)
         if i < 24:
             if not (s == 200 and r.get("round") == i + 2 and r.get("session_id") == SID
                     and len(r.get("nonce", "")) == 32):
                 check(f"round {i+1} advance", False, f"{s} {r}")
                 break
             tasks_seen.add(r["task"])
-            NONCE = r["nonce"]
+            NONCE, TASK = r["nonce"], r["task"]
         else:
             done = s == 200 and r.get("gauntlet_passed") is True
     check("25-round happy path", done, f"last: {s} {r}")
@@ -132,12 +132,12 @@ try:
 
     # ---- nonce reuse: old round nonce no longer valid
     s, r = call(BASE, "POST", "/api/v1/verification/gauntlet/start", headers=H1)
-    SID3, N1 = r["session_id"], r["nonce"]
-    s, r = answer(BASE, H1, SID3, N1)
+    SID3, N3, T3 = r["session_id"], r["nonce"], r["task"]
+    s, r = answer(BASE, H1, SID3, N3, T3)
     check("round 1 ok (reuse setup)", s == 200 and r.get("round") == 2, f"{s} {r}")
     s, r = call(BASE, "POST", "/api/v1/verification/gauntlet/answer",
-                {"session_id": SID3, "nonce": N1,
-                 "text": f"reusing the old nonce {N1} should not work at all"}, headers=H1)
+                {"session_id": SID3, "nonce": N3,
+                 "text": f"reusing the old nonce {N3} should not work at all"}, headers=H1)
     check("stale nonce rejected", s == 403, f"{s} {r}")
 
     # ---- secret scan on answer text
@@ -147,6 +147,28 @@ try:
                 {"session_id": SID4, "nonce": N4,
                  "text": f"answer with {N4} and my api_key: <redacted>"}, headers=H1)
     check("secret scan rejects gauntlet answer", s == 400, f"{s} {r}")
+
+    # ---- reversed-nonce round: task and validator must agree.
+    # Regression: the task asked for the nonce reversed while the validator
+    # demanded the original, so following the instructions failed the round.
+    s, r = call(BASE, "POST", "/api/v1/register", {"agent_name": "gauntlet_three", "model": "TestModel 3.0"})
+    H3 = {"Authorization": f"Bearer {r['api_key']}"}
+    s, r = call(BASE, "POST", "/api/v1/verification/gauntlet/start", headers=H3)
+    sid, nonce, task = r["session_id"], r["nonce"], r["task"]
+    s, r = answer(BASE, H3, sid, nonce, task)   # round 1 (couplet)
+    s, r = answer(BASE, H3, sid, r["nonce"], r["task"])  # round 2 (haiku)
+    check("reached the reversed round", s == 200 and "reversed" in r.get("task", ""), f"{s} {r}")
+    nonce3 = r["nonce"]
+    s, r = call(BASE, "POST", "/api/v1/verification/gauntlet/answer",
+                {"session_id": sid, "nonce": nonce3,
+                 "text": f"original nonce {nonce3} instead of its mirror image here"}, headers=H3)
+    check("reversed round rejects the original nonce", s == 403, f"{s} {r}")
+    s, r = call(BASE, "POST", "/api/v1/verification/gauntlet/start", headers=H3)
+    sid, nonce, task = r["session_id"], r["nonce"], r["task"]
+    s, r = answer(BASE, H3, sid, nonce, task)   # round 1
+    s, r = answer(BASE, H3, sid, r["nonce"], r["task"])  # round 2
+    s, r = answer(BASE, H3, sid, r["nonce"], r["task"])  # round 3 (reversed)
+    check("reversed round accepts the reversed nonce", s == 200 and r.get("round") == 4, f"{s} {r}")
 
     # ---- unknown session
     s, r = call(BASE, "POST", "/api/v1/verification/gauntlet/answer",
