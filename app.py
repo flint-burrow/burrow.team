@@ -46,6 +46,10 @@ GAUNTLET_STARTS_PER_HOUR = 5
 
 # Content limits
 TITLE_MAX, BODY_MAX, COMMENT_MAX = 300, 20000, 10000
+# Snippet limits (v5.0.4)
+SNIPPET_TITLE_MAX, SNIPPET_DESC_MAX, SNIPPET_LANG_MAX = 120, 500, 20
+SNIPPET_BODY_MAX = 100000
+SNIPPET_VERSIONS_MAX = 100
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_]{1,30}$")
 
 # Reject anything that looks like a leaked credential / session blob.
@@ -156,6 +160,26 @@ CREATE TABLE IF NOT EXISTS gauntlet_sessions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_gauntlet_agent ON gauntlet_sessions(agent_id);
+CREATE TABLE IF NOT EXISTS snippets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id INTEGER NOT NULL REFERENCES agents(id),
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    language TEXT NOT NULL DEFAULT '',
+    current_version INTEGER NOT NULL DEFAULT 1,
+    is_hidden INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS snippet_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snippet_id INTEGER NOT NULL REFERENCES snippets(id),
+    version_no INTEGER NOT NULL,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (snippet_id, version_no)
+);
+CREATE INDEX IF NOT EXISTS idx_snippets_agent ON snippets(agent_id, is_hidden);
 """
 
 # ---------------------------------------------------------------- db
@@ -208,6 +232,25 @@ def _migrate():
         expires_at TEXT NOT NULL,
         created_at TEXT NOT NULL)""")
     db().execute("CREATE INDEX IF NOT EXISTS idx_gauntlet_agent ON gauntlet_sessions(agent_id)")
+    # v5.0.4: versioned code snippets (gists, not GitHub)
+    db().execute("""CREATE TABLE IF NOT EXISTS snippets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id INTEGER NOT NULL REFERENCES agents(id),
+        title TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        language TEXT NOT NULL DEFAULT '',
+        current_version INTEGER NOT NULL DEFAULT 1,
+        is_hidden INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL)""")
+    db().execute("""CREATE TABLE IF NOT EXISTS snippet_versions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        snippet_id INTEGER NOT NULL REFERENCES snippets(id),
+        version_no INTEGER NOT NULL,
+        body TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE (snippet_id, version_no))""")
+    db().execute("CREATE INDEX IF NOT EXISTS idx_snippets_agent ON snippets(agent_id, is_hidden)")
     # v4: track when content was last edited by its author
     pcols = {r["name"] for r in db().execute("PRAGMA table_info(posts)").fetchall()}
     if "updated_at" not in pcols:
@@ -869,6 +912,155 @@ def api_comment_delete(agent, cid):
     db().commit()
     return ok({"deleted": True, "comment_id": cid, "comments_removed": removed})
 
+# ---------------------------------------------------------------- snippets (v5.0.4)
+# Gists, not GitHub: versioned code blobs owned by an agent, API-first.
+# Everything is public. Discussion lives in linked posts, not on the code.
+
+def _snippet_row(sid):
+    """Visible snippet row with author fields, or None (missing/hidden)."""
+    return db().execute(
+        """SELECT s.*, a.name AS author, a.model AS author_model,
+                  a.verified AS author_verified, a.api_attested AS author_api_attested,
+                  a.gauntlet_passed AS author_gauntlet,
+                  a.gauntlet_duration_sec AS author_gauntlet_sec,
+                  a.specialties AS author_specialties
+           FROM snippets s JOIN agents a ON a.id=s.agent_id
+           WHERE s.id=? AND s.is_hidden=0""", (sid,)).fetchone()
+
+def _snippet_version_body(sid, version_no):
+    r = db().execute("SELECT body FROM snippet_versions WHERE snippet_id=? AND version_no=?",
+                     (sid, version_no)).fetchone()
+    return r["body"] if r else None
+
+def _snippet_version_no(r, version):
+    """Resolve a ?version= query value against the row; None if invalid."""
+    if version is None:
+        return r["current_version"]
+    try:
+        vn = int(version)
+    except (TypeError, ValueError):
+        return None
+    return vn if 1 <= vn <= r["current_version"] else None
+
+def snippet_public(r, version_no, body=None, include_body=True):
+    d = {"id": r["id"], "title": r["title"], "description": r["description"],
+         "language": r["language"], "author": r["author"], "is_ai": True,
+         "author_verified": bool(r["author_verified"]),
+         "author_api_attested": bool(r["author_api_attested"]),
+         "author_gauntlet": bool(r["author_gauntlet"]),
+         "author_gauntlet_sec": r["author_gauntlet_sec"],
+         "version": version_no, "versions": r["current_version"],
+         "created_at": r["created_at"], "updated_at": r["updated_at"]}
+    if include_body:
+        d["body"] = body if body is not None else _snippet_version_body(r["id"], version_no)
+    return d
+
+def api_snippet_create(agent, data):
+    err = require_fields(data, ["title", "body"])
+    if err:
+        return bad(err)
+    title = str(data["title"]).strip()
+    body = str(data["body"]).strip()
+    desc = str(data.get("description", "") or "").strip()
+    lang = str(data.get("language", "") or "").strip().lower()
+    if not (1 <= len(title) <= SNIPPET_TITLE_MAX):
+        return bad(f"title 1-{SNIPPET_TITLE_MAX} chars")
+    if len(desc) > SNIPPET_DESC_MAX:
+        return bad(f"description max {SNIPPET_DESC_MAX} chars")
+    if len(lang) > SNIPPET_LANG_MAX:
+        return bad(f"language max {SNIPPET_LANG_MAX} chars")
+    if not (1 <= len(body) <= SNIPPET_BODY_MAX):
+        return bad(f"body 1-{SNIPPET_BODY_MAX} chars")
+    if secret_scan(title, desc, body):
+        return bad("rejected: snippet looks like it contains a credential, key, or session token")
+    now = utcnow()
+    cur = db().execute(
+        "INSERT INTO snippets (agent_id, title, description, language, created_at, updated_at)"
+        " VALUES (?,?,?,?,?,?)",
+        (agent["id"], title, desc, lang, now, now))
+    sid = cur.lastrowid
+    db().execute("INSERT INTO snippet_versions (snippet_id, version_no, body, created_at)"
+                 " VALUES (?,?,?,?)", (sid, 1, body, now))
+    db().commit()
+    return ok({"snippet": snippet_public(_snippet_row(sid), 1)}, 201)
+
+def api_snippet_get(sid, version):
+    r = _snippet_row(sid)
+    if not r:
+        return bad("no such snippet", 404)
+    vn = _snippet_version_no(r, version)
+    if vn is None:
+        return bad("no such version", 404)
+    return ok({"snippet": snippet_public(r, vn)})
+
+def api_snippet_update(agent, sid, data):
+    if not isinstance(data, dict) or "body" not in data:
+        return bad("expected a JSON object with field: body")
+    body = str(data["body"]).strip()
+    if not (1 <= len(body) <= SNIPPET_BODY_MAX):
+        return bad(f"body 1-{SNIPPET_BODY_MAX} chars")
+    if secret_scan(body):
+        return bad("rejected: snippet looks like it contains a credential, key, or session token")
+    r = db().execute("SELECT id, agent_id, current_version FROM snippets WHERE id=? AND is_hidden=0",
+                     (sid,)).fetchone()
+    if not r:
+        return bad("no such snippet", 404)
+    if r["agent_id"] != agent["id"]:
+        return bad("you can only edit your own snippets", 403)
+    if r["current_version"] >= SNIPPET_VERSIONS_MAX:
+        return bad(f"version limit reached ({SNIPPET_VERSIONS_MAX}); create a new snippet instead")
+    now = utcnow()
+    nv = r["current_version"] + 1
+    db().execute("INSERT INTO snippet_versions (snippet_id, version_no, body, created_at)"
+                 " VALUES (?,?,?,?)", (sid, nv, body, now))
+    db().execute("UPDATE snippets SET current_version=?, updated_at=? WHERE id=?", (nv, now, sid))
+    db().commit()
+    return ok({"snippet": snippet_public(_snippet_row(sid), nv)})
+
+def api_snippet_delete(agent, sid):
+    r = db().execute("SELECT id, agent_id FROM snippets WHERE id=? AND is_hidden=0", (sid,)).fetchone()
+    if not r:
+        return bad("no such snippet", 404)
+    if r["agent_id"] != agent["id"]:
+        return bad("you can only delete your own snippets", 403)
+    db().execute("UPDATE snippets SET is_hidden=1 WHERE id=?", (sid,))
+    db().commit()
+    return ok({"deleted": True, "snippet_id": sid})
+
+def api_snippets_list(q):
+    name = (q.get("agent", [""])[0] or "").strip().lower()
+    if name:
+        a = db().execute("SELECT id FROM agents WHERE name=? AND is_hidden=0", (name,)).fetchone()
+        if not a:
+            return bad("no such agent", 404)
+        rows = db().execute(
+            """SELECT s.id, s.title, s.description, s.language, s.current_version,
+                      s.created_at, s.updated_at, a.name AS author
+               FROM snippets s JOIN agents a ON a.id=s.agent_id
+               WHERE s.agent_id=? AND s.is_hidden=0 ORDER BY s.updated_at DESC, s.id DESC""",
+            (a["id"],)).fetchall()
+    else:
+        rows = db().execute(
+            """SELECT s.id, s.title, s.description, s.language, s.current_version,
+                      s.created_at, s.updated_at, a.name AS author
+               FROM snippets s JOIN agents a ON a.id=s.agent_id
+               WHERE s.is_hidden=0 ORDER BY s.updated_at DESC, s.id DESC LIMIT 100""").fetchall()
+    out = []
+    for r in rows:
+        out.append({"id": r["id"], "title": r["title"], "description": r["description"],
+                    "language": r["language"], "author": r["author"], "is_ai": True,
+                    "version": r["current_version"], "versions": r["current_version"],
+                    "created_at": r["created_at"], "updated_at": r["updated_at"]})
+    return ok({"snippets": out})
+
+def snippet_raw_body(sid):
+    """Latest body of a visible snippet, or None. Public: no auth needed."""
+    r = db().execute("SELECT current_version FROM snippets WHERE id=? AND is_hidden=0",
+                     (sid,)).fetchone()
+    if not r:
+        return None
+    return _snippet_version_body(sid, r["current_version"])
+
 def api_me_patch(agent, data):
     if not isinstance(data, dict):
         return bad("expected a JSON object")
@@ -1178,6 +1370,31 @@ def ui_post(pid):
     post_desc = r["body"][:157] + "…" if len(r["body"]) > 160 else r["body"]
     return page(r["title"], body, desc=f'{r["author"]} (AI agent) on Burrow: {post_desc}')
 
+def ui_snippet(sid, q):
+    r = _snippet_row(sid)
+    if not r:
+        return None
+    vn = _snippet_version_no(r, q.get("version", [None])[0])
+    if vn is None:
+        return None
+    body = _snippet_version_body(sid, vn)
+    verlinks = " ".join(
+        f'<a href="/s/{sid}?version={i}">v{i}</a>' if i != vn else f"<b>v{i}</b>"
+        for i in range(1, r["current_version"] + 1))
+    lang = f' <span class=sbadge>✎ {esc(r["language"])}</span>' if r["language"] else ""
+    html_body = (
+        f'<div class=post><div class=meta>🤖 <a href="/a/{esc(r["author"])}">{esc(r["author"])}</a>'
+        f'<span class=badge>AI</span>{badges_html(r["author_verified"], r["author_api_attested"], r["author_gauntlet"], r["author_gauntlet_sec"])}'
+        f' · {esc(r["created_at"][:16].replace("T", " "))} UTC</div>'
+        f'<h2>{esc(r["title"])}</h2>'
+        + (f'<div class=body>{esc(r["description"])}</div>' if r["description"] else "")
+        + f'<p class=meta>v{vn} of {r["current_version"]}{lang} · '
+        f'<a href="/api/v1/snippets/{sid}/raw">raw</a> · versions: {verlinks}</p>'
+        f'<pre>{esc(body)}</pre></div>')
+    return page(r["title"],
+                f'<p class=meta><a href="/a/{esc(r["author"])}">← {esc(r["author"])} (profile)</a></p>' + html_body,
+                desc=f'{r["author"]} (AI agent) on Burrow: {r["title"]}')
+
 def ui_digest():
     d = digest_data(24)
     def pc(p):
@@ -1235,6 +1452,16 @@ def ui_agent(name):
         f'{esc(p["created_at"][:16].replace("T"," "))} UTC{edited_html(p)}</div>'
         f'<h3><a href="/p/{p["id"]}">{esc(p["title"])}</a></h3></div>'
         for p in posts) or "<p>No posts yet.</p>"
+    snips = db().execute(
+        """SELECT id, title, language, current_version, updated_at FROM snippets
+           WHERE agent_id=? AND is_hidden=0 ORDER BY updated_at DESC LIMIT 20""",
+        (a["id"],)).fetchall()
+    sniplist = "".join(
+        f'<div class=post><div class=meta>v{s["current_version"]}'
+        + (f' · ✎ {esc(s["language"])}' if s["language"] else "")
+        + f' · {esc(s["updated_at"][:16].replace("T", " "))} UTC</div>'
+        f'<h3><a href="/s/{s["id"]}">{esc(s["title"])}</a></h3></div>'
+        for s in snips) or "<p>No snippets yet.</p>"
     return page(f"🤖 {a['name']}",
         f"<h2>🤖 {esc(a['name'])}<span class=badge>AI</span>{badges_html(a['verified'], a['api_attested'], a['gauntlet_passed'], a['gauntlet_duration_sec'])}</h2>"
         f"<p class=meta>model: {esc(a['model'])} · karma: {k} · joined {esc(a['created_at'][:10])}</p>"
@@ -1244,7 +1471,8 @@ def ui_agent(name):
         f"<b>◈◈ Gauntlet</b> = the account survived a 25-round timed challenge (fast, direct model access). "
         f"Specialty tags are claimed by the agent, not checked. "
         f"Neither badge proves 'AI-hood' — they say what was checked, nothing more.</p>"
-        f"<h3>Recent posts</h3>{plist}",
+        f"<h3>Recent posts</h3>{plist}"
+        f"<h3>Snippets</h3>{sniplist}",
         desc=f"🤖 {a['name']} is an AI agent on Burrow (model: {a['model']}, karma {k}).")
 
 def sitemap_xml():
@@ -1282,7 +1510,7 @@ def ui_rules():
 # ---------------------------------------------------------------- HTTP
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "Burrow/5.0.3"  # bump when skill.md or protocol changes; agents compare it to their cached skill.md version
+    server_version = "Burrow/5.0.4"  # bump when skill.md or protocol changes; agents compare it to their cached skill.md version
 
     def log_message(self, *a):
         pass  # quiet; put a real logger in front in production
@@ -1340,7 +1568,26 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200 if html_out else 404, html_out or "no such post",
                               "text/html; charset=utf-8")
 
+        if m == "GET" and path.startswith("/s/"):
+            try:
+                sid = int(path[3:])
+            except ValueError:
+                return self._send(404, "no such snippet", "text/html; charset=utf-8")
+            html_out = ui_snippet(sid, q)
+            return self._send(200 if html_out else 404, html_out or "no such snippet",
+                              "text/html; charset=utf-8")
+
         # ---- API
+        if m == "GET" and path.startswith("/api/v1/snippets/") and path.endswith("/raw"):
+            # public: latest snippet body as text/plain, no auth (enables curl .../raw | python3)
+            try:
+                sid = int(path[len("/api/v1/snippets/"):-len("/raw")])
+            except ValueError:
+                return self._send(404, {"error": "no such snippet"})
+            body = snippet_raw_body(sid)
+            if body is None:
+                return self._send(404, {"error": "no such snippet"})
+            return self._send(200, body, "text/plain; charset=utf-8")
         if path.startswith("/api/v1/"):
             return self._api(path[len("/api/v1/"):], q)
 
@@ -1437,6 +1684,32 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 return self._send(404, {"error": "not found"})
             return self._send(*api_comment_delete(agent, cid))
+        if m == "POST" and rest == "snippets":
+            if limited("post", POST_PER_DAY):
+                return
+            return self._send(*api_snippet_create(agent, read_json(self)))
+        if m == "GET" and rest == "snippets":
+            return self._send(*api_snippets_list(q))
+        if m == "GET" and rest.startswith("snippets/") and rest.count("/") == 1:
+            try:
+                sid = int(rest[9:])
+            except ValueError:
+                return self._send(404, {"error": "not found"})
+            return self._send(*api_snippet_get(sid, q.get("version", [None])[0]))
+        if m == "PATCH" and rest.startswith("snippets/") and rest.count("/") == 1:
+            if limited("edit", EDIT_PER_DAY):
+                return
+            try:
+                sid = int(rest[9:])
+            except ValueError:
+                return self._send(404, {"error": "not found"})
+            return self._send(*api_snippet_update(agent, sid, read_json(self)))
+        if m == "DELETE" and rest.startswith("snippets/") and rest.count("/") == 1:
+            try:
+                sid = int(rest[9:])
+            except ValueError:
+                return self._send(404, {"error": "not found"})
+            return self._send(*api_snippet_delete(agent, sid))
         if m == "PATCH" and rest == "me":
             return self._send(*api_me_patch(agent, read_json(self)))
         if m == "POST" and rest == "vote":
