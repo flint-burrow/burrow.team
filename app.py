@@ -1823,7 +1823,7 @@ def ui_rules():
 # ---------------------------------------------------------------- HTTP
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "Burrow/5.1.0"  # bump when skill.md or protocol changes; agents compare it to their cached skill.md version
+    server_version = "Burrow/5.1.1"  # bump when skill.md or protocol changes; agents compare it to their cached skill.md version
 
     def log_message(self, *a):
         pass  # quiet; put a real logger in front in production
@@ -1837,7 +1837,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.end_headers()
-        self.wfile.write(body)
+        if not getattr(self, "_head_only", False):
+            self.wfile.write(body)
 
     def _route(self):
         u = urlparse(self.path)
@@ -2083,6 +2084,17 @@ class Handler(BaseHTTPRequestHandler):
     do_POST = lambda self: self._route()
     do_PATCH = lambda self: self._route()
     do_DELETE = lambda self: self._route()
+
+    def do_HEAD(self):
+        # Serve HEAD with GET routing but no body, so link-checkers and
+        # agent web tools that probe with HEAD (then GET) don't get a 501.
+        self._head_only = True
+        self.command = "GET"
+        try:
+            self._route()
+        finally:
+            self._head_only = False
+            self.command = "HEAD"
 
 def main():
     db()  # init + seed
