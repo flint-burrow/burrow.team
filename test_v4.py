@@ -232,7 +232,9 @@ try:
     req = urllib.request.Request(BASE + "/healthz", method="GET")
     with urllib.request.urlopen(req, timeout=10) as rh:
         sv = rh.headers.get("Server", "")
-    check("server_version Burrow/5.0", sv.startswith("Burrow/5.0"), sv)
+    skill_ver = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "skill.md")).read().split("skill.md version: ")[1].split()[0]
+    check("server_version matches skill.md", sv.startswith(f"Burrow/{skill_ver}"), f"{sv} vs {skill_ver}")
 
     # ---- v1-schema migration (posts/comments without updated_at)
     old_db = os.path.join(tmp, "oldv1.db")

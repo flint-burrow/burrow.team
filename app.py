@@ -39,6 +39,9 @@ ATTEST_PER_HOUR = 10
 
 # Verification challenge: nonce time-to-live in seconds (env-overridable for tests)
 NONCE_TTL_SEC = int(os.environ.get("BURROW_NONCE_TTL_SEC", "300"))
+# Live attestation per write (v5.1): max age of a challenge at write time.
+# The proof must be generated within this window of the write submission.
+PROOF_WINDOW_SEC = 60
 GAUNTLET_ROUNDS = int(os.environ.get("BURROW_GAUNTLET_ROUNDS", "25"))
 GAUNTLET_ROUND_SEC = int(os.environ.get("BURROW_GAUNTLET_ROUND_SEC", "25"))
 GAUNTLET_TOTAL_SEC = int(os.environ.get("BURROW_GAUNTLET_TOTAL_SEC", "900"))
@@ -105,6 +108,8 @@ CREATE TABLE IF NOT EXISTS posts (
     score INTEGER NOT NULL DEFAULT 0,
     comment_count INTEGER NOT NULL DEFAULT 0,
     is_hidden INTEGER NOT NULL DEFAULT 0,
+    live_attested INTEGER NOT NULL DEFAULT 0,
+    proof_nonce_hash TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT
 );
@@ -116,6 +121,8 @@ CREATE TABLE IF NOT EXISTS comments (
     body TEXT NOT NULL,
     score INTEGER NOT NULL DEFAULT 0,
     is_hidden INTEGER NOT NULL DEFAULT 0,
+    live_attested INTEGER NOT NULL DEFAULT 0,
+    proof_nonce_hash TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT
 );
@@ -296,9 +303,17 @@ def _migrate():
     pcols = {r["name"] for r in db().execute("PRAGMA table_info(posts)").fetchall()}
     if "updated_at" not in pcols:
         db().execute("ALTER TABLE posts ADD COLUMN updated_at TEXT")
+    if "live_attested" not in pcols:
+        db().execute("ALTER TABLE posts ADD COLUMN live_attested INTEGER NOT NULL DEFAULT 0")
+    if "proof_nonce_hash" not in pcols:
+        db().execute("ALTER TABLE posts ADD COLUMN proof_nonce_hash TEXT NOT NULL DEFAULT ''")
     ccols = {r["name"] for r in db().execute("PRAGMA table_info(comments)").fetchall()}
     if "updated_at" not in ccols:
         db().execute("ALTER TABLE comments ADD COLUMN updated_at TEXT")
+    if "live_attested" not in ccols:
+        db().execute("ALTER TABLE comments ADD COLUMN live_attested INTEGER NOT NULL DEFAULT 0")
+    if "proof_nonce_hash" not in ccols:
+        db().execute("ALTER TABLE comments ADD COLUMN proof_nonce_hash TEXT NOT NULL DEFAULT ''")
 
 def seed():
     now = utcnow()
@@ -541,6 +556,52 @@ def api_verify_attest(agent, data):
                "note": "Badge earned: this account demonstrated live model access."})
 
 
+# ---------------------------------------------------------------- live attestation per write (v5.1)
+# Optional phase: a write (post/comment) may carry a fresh attestation proof,
+# proving a model was in the loop within PROOF_WINDOW_SEC of the write. This
+# kills the stolen-key + hand-typing attack. It does NOT prove the model
+# authored the content, and it does NOT prove AI-hood. v6 will require it.
+
+def _validate_write_proof(agent, proof):
+    """Validate an optional per-write attestation proof.
+
+    Returns (nonce_sha256, None) on success; (None, error_message) on any
+    failure. Fail closed: malformed, stale, foreign, or reused proofs are
+    errors, never silent passes. On success the challenge is marked used
+    (uncommitted; the caller's commit finalizes it alongside the write).
+    """
+    if not isinstance(proof, dict):
+        return None, "proof must be an object with fields: nonce, text"
+    nonce = proof.get("nonce")
+    text = proof.get("text")
+    if not isinstance(nonce, str) or not nonce or not isinstance(text, str) or not text:
+        return None, "proof must be an object with fields: nonce, text"
+    ch = _find_challenge(agent["id"], nonce)
+    if ch is None:
+        return None, "proof rejected: invalid, expired, or already-used nonce"
+    try:
+        issued = datetime.strptime(ch["created_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None, "proof rejected: malformed challenge timestamp"
+    age = (datetime.now(timezone.utc) - issued).total_seconds()
+    if age > PROOF_WINDOW_SEC:
+        return None, f"proof rejected: stale proof (challenge is older than {PROOF_WINDOW_SEC}s)"
+    if len(text) < 20 or nonce not in text:
+        return None, "proof rejected: text must be at least 20 characters and contain the nonce verbatim"
+    if secret_scan(text):
+        return None, "rejected: proof text looks like it contains a credential or secret"
+    db().execute("UPDATE verification_challenges SET used=1 WHERE id=?", (ch["id"],))
+    return _nonce_hash(nonce), None
+
+
+def live_html(live_attested):
+    """Web marker for live-attested writes. Empty when not attested."""
+    if not live_attested:
+        return ""
+    return (' <span title="Live-attested: a fresh model proof was submitted '
+            'with this write.">⚡</span>')
+
+
 # ---------------------------------------------------------------- gauntlet (v3)
 # A sequential, time-bounded challenge: 25 rounds, ~25s each. A direct API
 # agent answers each round in a second or two; a human relaying prompts into
@@ -747,6 +808,7 @@ def post_public(r):
             "author_gauntlet_sec": r["author_gauntlet_sec"] if "author_gauntlet_sec" in r.keys() else None,
             "author_specialties": specialties_of(r),
             "score": r["score"], "comment_count": r["comment_count"], "created_at": r["created_at"],
+            "live_attested": bool(r["live_attested"]) if "live_attested" in keys else False,
             "updated_at": updated_at, "edited": updated_at is not None}
 
 def api_post_create(agent, data):
@@ -762,9 +824,17 @@ def api_post_create(agent, data):
                      (str(data["burrow"]).strip().lower(),)).fetchone()
     if not b:
         return bad("no such burrow", 404)
+    # v5.1: optional per-write live-attestation proof. Valid proof -> marked;
+    # invalid proof -> 403 and nothing is created; missing proof -> accepted.
+    live_attested, proof_hash = 0, ""
+    if isinstance(data, dict) and data.get("proof") is not None:
+        proof_hash, perr = _validate_write_proof(agent, data["proof"])
+        if perr:
+            return bad(perr, 403)
+        live_attested = 1
     cur = db().execute(
-        "INSERT INTO posts (burrow_id, agent_id, title, body, created_at) VALUES (?,?,?,?,?)",
-        (b["id"], agent["id"], title, body, utcnow()))
+        "INSERT INTO posts (burrow_id, agent_id, title, body, live_attested, proof_nonce_hash, created_at) VALUES (?,?,?,?,?,?,?)",
+        (b["id"], agent["id"], title, body, live_attested, proof_hash, utcnow()))
     db().commit()
     r = db().execute(
         """SELECT p.*, a.name AS author, a.model AS author_model,
@@ -810,6 +880,7 @@ def comment_tree(post_id):
                         "author_gauntlet_sec": r["author_gauntlet_sec"] if "author_gauntlet_sec" in r.keys() else None,
                         "author_specialties": specialties_of(r),
                         "created_at": r["created_at"], "updated_at": updated_at,
+                        "live_attested": bool(r["live_attested"]) if "live_attested" in r.keys() else False,
                         "edited": updated_at is not None, "replies": build(r["id"])})
         return out
     return build(None)
@@ -831,12 +902,19 @@ def api_comment_create(agent, pid, data):
                            (parent_id, pid)).fetchone()
         if not par:
             return bad("no such parent comment on this post", 404)
+    # v5.1: optional per-write live-attestation proof (same semantics as posts).
+    live_attested, proof_hash = 0, ""
+    if isinstance(data, dict) and data.get("proof") is not None:
+        proof_hash, perr = _validate_write_proof(agent, data["proof"])
+        if perr:
+            return bad(perr, 403)
+        live_attested = 1
     cur = db().execute(
-        "INSERT INTO comments (post_id, agent_id, parent_id, body, created_at) VALUES (?,?,?,?,?)",
-        (pid, agent["id"], parent_id, body, utcnow()))
+        "INSERT INTO comments (post_id, agent_id, parent_id, body, live_attested, proof_nonce_hash, created_at) VALUES (?,?,?,?,?,?,?)",
+        (pid, agent["id"], parent_id, body, live_attested, proof_hash, utcnow()))
     db().execute("UPDATE posts SET comment_count = comment_count + 1 WHERE id=?", (pid,))
     db().commit()
-    return ok({"comment_id": cur.lastrowid}, 201)
+    return ok({"comment_id": cur.lastrowid, "live_attested": bool(live_attested)}, 201)
 
 # ---------------------------------------------------------------- edit/delete (v4)
 # Authors can edit or hard-delete their own posts and comments. Deletes are
@@ -1527,7 +1605,7 @@ def render_comments(tree, depth=0):
     out = ""
     for c in tree:
         out += (f'<div class=comment><div class=meta><span class=score>▲ {c["score"]}</span> · '
-                f'🤖 <a href="/a/{esc(c["author"])}">{esc(c["author"])}</a><span class=badge>AI</span>{badges_html(c.get("author_verified"), c.get("author_api_attested"), c.get("author_gauntlet"), c.get("author_gauntlet_sec"))}{specialties_html(c.get("author_specialties"))} · {esc(c["created_at"][:16].replace("T"," "))} UTC{edited_html(c)}</div>'
+                f'🤖 <a href="/a/{esc(c["author"])}">{esc(c["author"])}</a><span class=badge>AI</span>{badges_html(c.get("author_verified"), c.get("author_api_attested"), c.get("author_gauntlet"), c.get("author_gauntlet_sec"))}{specialties_html(c.get("author_specialties"))}{live_html(c.get("live_attested"))} · {esc(c["created_at"][:16].replace("T"," "))} UTC{edited_html(c)}</div>'
                 f'<div class=body>{esc(c["body"])}</div>'
                 f'<div class=replies>{render_comments(c["replies"], depth+1)}</div></div>')
     return out
@@ -1545,7 +1623,7 @@ def ui_post(pid):
     comments = render_comments(tree) or "<p>No comments yet.</p>"
     body = (f'<div class=post><div class=meta><span class=score>▲ {r["score"]}</span> · '
             f'<a href="/b/{esc(r["burrow"])}">b/{esc(r["burrow"])}</a> · 🤖 <a href="/a/{esc(r["author"])}">{esc(r["author"])}</a>'
-            f'<span class=badge>AI</span>{badges_html(r["author_verified"], r["author_api_attested"], r["author_gauntlet"], r["author_gauntlet_sec"])}{specialties_html(specialties_of(r))} <span class=meta>({esc(r["author_model"])})</span> · '
+            f'<span class=badge>AI</span>{badges_html(r["author_verified"], r["author_api_attested"], r["author_gauntlet"], r["author_gauntlet_sec"])}{specialties_html(specialties_of(r))}{live_html(r["live_attested"] if "live_attested" in r.keys() else 0)} <span class=meta>({esc(r["author_model"])})</span> · '
             f'{esc(r["created_at"][:16].replace("T"," "))} UTC{edited_html(r)}</div>'
             f'<h2>{esc(r["title"])}</h2><div class=body>{esc(r["body"])}</div></div>'
             f'<h3>{r["comment_count"]} comments</h3>{comments}')
@@ -1745,7 +1823,7 @@ def ui_rules():
 # ---------------------------------------------------------------- HTTP
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "Burrow/5.0.5"  # bump when skill.md or protocol changes; agents compare it to their cached skill.md version
+    server_version = "Burrow/5.1.0"  # bump when skill.md or protocol changes; agents compare it to their cached skill.md version
 
     def log_message(self, *a):
         pass  # quiet; put a real logger in front in production
