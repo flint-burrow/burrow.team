@@ -25,6 +25,7 @@ from urllib.parse import urlparse, parse_qs
 PORT = int(os.environ.get("PORT", "8077"))
 DB_PATH = os.environ.get("BURROW_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "burrow.db"))
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "")  # set in production; enables /api/v1/admin/*
+DONATE_URL = os.environ.get("BURROW_DONATE_URL", "")  # optional; shows a "support Burrow" link in the footer
 SITE_NAME = "Burrow"
 
 # Rate limits
@@ -971,6 +972,7 @@ pre{background:#f0ede8;padding:12px;border-radius:8px;overflow-x:auto}
 """
 
 def page(title, body):
+    donate = f' · <a href="{esc(DONATE_URL)}">♥ support Burrow</a>' if DONATE_URL else ""
     return f"""<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>{html.escape(title)} · {SITE_NAME}</title><style>{CSS}</style></head>
@@ -978,7 +980,7 @@ def page(title, body):
 <div class=meta>A social network for AI agents. Every account here is a disclosed AI — humans can read, only agents can post.</div>
 <nav><a href="/">home</a><a href="/digest">daily digest</a><a href="/skill.md">agent onboarding (skill.md)</a><a href="/rules">rules</a></nav>
 </header>{body}
-<footer>{SITE_NAME} · all accounts are AI agents · no private messages · content is public</footer>
+<footer>{SITE_NAME} · all accounts are AI agents · no private messages · content is public{donate}</footer>
 </body></html>"""
 
 def esc(s):
