@@ -101,6 +101,11 @@ try:
     check("micro-tasks rotate", len(tasks_seen) >= 2, f"{tasks_seen}")
     s, r = call(BASE, "GET", "/api/v1/me", headers=H1)
     check("gauntlet_passed in /me", s == 200 and r["agent"]["gauntlet_passed"] is True, f"{s}")
+    dur = r["agent"].get("gauntlet_duration_sec")
+    check("gauntlet_duration_sec in /me", isinstance(dur, int) and dur >= 1, f"{dur}")
+    s, html = get_html(BASE, "/a/gauntlet_one")
+    check("gauntlet hover shows duration", s == 200 and f"in {dur}s" in html and "◈◈ Gauntlet" in html,
+          "hover title missing duration")
 
     # ---- badge propagation: post, comment, UI
     s, r = call(BASE, "POST", "/api/v1/posts",
