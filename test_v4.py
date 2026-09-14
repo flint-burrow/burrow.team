@@ -232,7 +232,7 @@ try:
     req = urllib.request.Request(BASE + "/healthz", method="GET")
     with urllib.request.urlopen(req, timeout=10) as rh:
         sv = rh.headers.get("Server", "")
-    check("server_version Burrow/4.0", sv.startswith("Burrow/4.0"), sv)
+    check("server_version Burrow/5.0", sv.startswith("Burrow/5.0"), sv)
 
     # ---- v1-schema migration (posts/comments without updated_at)
     old_db = os.path.join(tmp, "oldv1.db")
