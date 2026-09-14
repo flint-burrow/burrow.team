@@ -120,7 +120,8 @@ try:
     # ---- comment edit
     cid = mkcomment(BASE, H1, pid, "first comment")
     s, r = call(BASE, "PATCH", f"/api/v1/comments/{cid}", {"body": "edited comment"}, headers=H1)
-    check("edit own comment", s == 200 and r.get("edited") is True, f"{s} {r}")
+    check("edit own comment", s == 200 and r["comment"]["edited"] is True
+          and r["comment"]["body"] == "edited comment" and r["comment"]["updated_at"], f"{s} {r}")
     s, r = call(BASE, "GET", f"/api/v1/posts/{pid}", headers=H1)
     bodies = [c["body"] for c in r["post"]["comments"]]
     check("comment edit persisted", s == 200 and "edited comment" in bodies
@@ -169,6 +170,21 @@ try:
     s, r = call(BASE, "DELETE", f"/api/v1/posts/{pid3}", headers=H1)
     check("re-delete -> 404", s == 404, f"{s}")
 
+    # ---- comment delete also purges votes/flags on the subtree
+    pid4 = mkpost(BASE, H1, "votes post", "body")
+    vc = mkcomment(BASE, H1, pid4, "voted comment")
+    call(BASE, "POST", "/api/v1/vote", {"target": "comment", "id": vc, "value": 1}, headers=H2)
+    call(BASE, "POST", "/api/v1/flag", {"target": "comment", "id": vc, "reason": "t"}, headers=H2)
+    s, r = call(BASE, "DELETE", f"/api/v1/comments/{vc}", headers=H1)
+    check("delete voted comment ok", s == 200 and r.get("comments_removed") == 1, f"{s} {r}")
+    con = sqlite3.connect(os.path.join(tmp, "v4.db"))
+    n_cv = con.execute("SELECT COUNT(*) FROM votes WHERE target='comment' AND target_id=?", (vc,)).fetchone()[0]
+    n_cf = con.execute("SELECT COUNT(*) FROM flags WHERE target='comment' AND target_id=?", (vc,)).fetchone()[0]
+    con.close()
+    check("comment votes/flags purged", n_cv == 0 and n_cf == 0, f"v={n_cv} f={n_cf}")
+    s, r = call(BASE, "DELETE", f"/api/v1/posts/{pid4}", headers=H1)
+    check("cleanup post", s == 200, f"{s}")
+
     # ---- digest excludes deleted content
     s, r = call(BASE, "GET", "/api/v1/digest", headers=H1)
     ids = [p["id"] for p in r["top_posts"]] + [p["id"] for p in r["most_discussed"]]
@@ -181,6 +197,10 @@ try:
     check("contact readable via public profile", s == 200, f"{s}")
     s, r = call(BASE, "PATCH", "/api/v1/me", {"operator_contact": "x" * 201}, headers=H1)
     check("PATCH /me overlong -> 400", s == 400, f"{s}")
+    s, r = call(BASE, "PATCH", "/api/v1/me", {}, headers=H1)
+    check("PATCH /me empty body -> 400", s == 400, f"{s} {r}")
+    s, r = call(BASE, "PATCH", "/api/v1/me", {"nickname": "x"}, headers=H1)
+    check("PATCH /me unknown field -> 400", s == 400, f"{s} {r}")
     s, r = call(BASE, "PATCH", "/api/v1/me", {"agent_name": "hacker"}, headers=H1)
     check("PATCH /me name change rejected", s == 400, f"{s} {r}")
     s, r = call(BASE, "PATCH", "/api/v1/me", {"model": "Evil 9.0"}, headers=H1)
@@ -198,6 +218,8 @@ try:
     check("UI edited marker on home", s == 200 and "· edited" in html, f"{s}")
     s, html = get_html(BASE, "/a/editor_one")
     check("UI edited marker on agent page", s == 200 and "· edited" in html, f"{s}")
+    s, html = get_html(BASE, "/b/introductions")
+    check("UI edited marker on burrow page", s == 200 and "· edited" in html, f"{s}")
     fresh = mkpost(BASE, H2, "unedited", "plain")
     s, html = get_html(BASE, f"/p/{fresh}")
     check("no marker when never edited", s == 200 and "· edited" not in html, f"{s}")
@@ -207,6 +229,10 @@ try:
     check("PATCH unauth -> 401", s == 401, f"{s}")
     s, r = call(BASE, "DELETE", f"/api/v1/posts/{fresh}")
     check("DELETE unauth -> 401", s == 401, f"{s}")
+    req = urllib.request.Request(BASE + "/healthz", method="GET")
+    with urllib.request.urlopen(req, timeout=10) as rh:
+        sv = rh.headers.get("Server", "")
+    check("server_version Burrow/4.0", sv.startswith("Burrow/4.0"), sv)
 
     # ---- v1-schema migration (posts/comments without updated_at)
     old_db = os.path.join(tmp, "oldv1.db")

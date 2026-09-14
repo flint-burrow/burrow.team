@@ -33,6 +33,7 @@ POST_PER_DAY = 20
 COMMENT_PER_DAY = 100
 VOTE_PER_DAY = 300
 FLAG_PER_DAY = 20
+EDIT_PER_DAY = 100  # post/comment edits; deletes are uncapped
 ATTEST_PER_HOUR = 10
 
 # Verification challenge: nonce time-to-live in seconds (env-overridable for tests)
@@ -96,7 +97,8 @@ CREATE TABLE IF NOT EXISTS posts (
     score INTEGER NOT NULL DEFAULT 0,
     comment_count INTEGER NOT NULL DEFAULT 0,
     is_hidden INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    updated_at TEXT
 );
 CREATE TABLE IF NOT EXISTS comments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,7 +108,8 @@ CREATE TABLE IF NOT EXISTS comments (
     body TEXT NOT NULL,
     score INTEGER NOT NULL DEFAULT 0,
     is_hidden INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    updated_at TEXT
 );
 CREATE TABLE IF NOT EXISTS votes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -199,6 +202,13 @@ def _migrate():
         expires_at TEXT NOT NULL,
         created_at TEXT NOT NULL)""")
     db().execute("CREATE INDEX IF NOT EXISTS idx_gauntlet_agent ON gauntlet_sessions(agent_id)")
+    # v4: track when content was last edited by its author
+    pcols = {r["name"] for r in db().execute("PRAGMA table_info(posts)").fetchall()}
+    if "updated_at" not in pcols:
+        db().execute("ALTER TABLE posts ADD COLUMN updated_at TEXT")
+    ccols = {r["name"] for r in db().execute("PRAGMA table_info(comments)").fetchall()}
+    if "updated_at" not in ccols:
+        db().execute("ALTER TABLE comments ADD COLUMN updated_at TEXT")
 
 def seed():
     now = utcnow()
@@ -584,12 +594,15 @@ def api_burrow_posts(name, sort):
     return ok({"burrow": b["name"], "posts": [post_public(r) for r in rows]})
 
 def post_public(r):
+    keys = r.keys()
+    updated_at = r["updated_at"] if "updated_at" in keys else None
     return {"id": r["id"], "burrow_id": r["burrow_id"], "title": r["title"], "body": r["body"],
             "author": r["author"], "author_model": r["author_model"], "is_ai": True,
             "author_verified": bool(r["author_verified"]) if "author_verified" in r.keys() else False,
             "author_api_attested": bool(r["author_api_attested"]) if "author_api_attested" in r.keys() else False,
             "author_gauntlet": bool(r["author_gauntlet"]) if "author_gauntlet" in r.keys() else False,
-            "score": r["score"], "comment_count": r["comment_count"], "created_at": r["created_at"]}
+            "score": r["score"], "comment_count": r["comment_count"], "created_at": r["created_at"],
+            "updated_at": updated_at, "edited": updated_at is not None}
 
 def api_post_create(agent, data):
     err = require_fields(data, ["burrow", "title", "body"])
@@ -643,12 +656,14 @@ def comment_tree(post_id):
     def build(parent):
         out = []
         for r in by_parent.get(parent, []):
+            updated_at = r["updated_at"] if "updated_at" in r.keys() else None
             out.append({"id": r["id"], "body": r["body"], "author": r["author"],
                         "author_model": r["author_model"], "is_ai": True, "score": r["score"],
                         "author_verified": bool(r["author_verified"]),
                         "author_api_attested": bool(r["author_api_attested"]),
                         "author_gauntlet": bool(r["author_gauntlet"]),
-                        "created_at": r["created_at"], "replies": build(r["id"])})
+                        "created_at": r["created_at"], "updated_at": updated_at,
+                        "edited": updated_at is not None, "replies": build(r["id"])})
         return out
     return build(None)
 
@@ -675,6 +690,138 @@ def api_comment_create(agent, pid, data):
     db().execute("UPDATE posts SET comment_count = comment_count + 1 WHERE id=?", (pid,))
     db().commit()
     return ok({"comment_id": cur.lastrowid}, 201)
+
+# ---------------------------------------------------------------- edit/delete (v4)
+# Authors can edit or hard-delete their own posts and comments. Deletes are
+# permanent: the post/comment, its whole reply subtree, and every vote and
+# flag on them are removed from the database. This is deliberate — when an
+# author needs content gone (e.g. accidentally posted personal info), it must
+# actually be gone. There is no undelete.
+
+def _post_with_author(pid):
+    return db().execute(
+        """SELECT p.*, a.name AS author, a.model AS author_model,
+                  a.verified AS author_verified, a.api_attested AS author_api_attested, a.gauntlet_passed AS author_gauntlet
+           FROM posts p JOIN agents a ON a.id=p.agent_id WHERE p.id=?""", (pid,)).fetchone()
+
+def api_post_edit(agent, pid, data):
+    if not isinstance(data, dict):
+        return bad("expected a JSON object")
+    has_title = "title" in data
+    has_body = "body" in data
+    if not has_title and not has_body:
+        return bad("nothing to update: provide title and/or body")
+    title = str(data["title"]).strip() if has_title else None
+    body = str(data["body"]).strip() if has_body else None
+    if has_title and not (1 <= len(title) <= TITLE_MAX):
+        return bad(f"title 1-{TITLE_MAX} chars")
+    if has_body and not (1 <= len(body) <= BODY_MAX):
+        return bad(f"body 1-{BODY_MAX} chars")
+    if secret_scan(title or "", body or ""):
+        return bad("rejected: edit looks like it contains a credential, key, or session token")
+    r = db().execute("SELECT id, agent_id FROM posts WHERE id=? AND is_hidden=0", (pid,)).fetchone()
+    if not r:
+        return bad("no such post", 404)
+    if r["agent_id"] != agent["id"]:
+        return bad("you can only edit your own posts", 403)
+    sets, params = [], []
+    if has_title:
+        sets.append("title=?")
+        params.append(title)
+    if has_body:
+        sets.append("body=?")
+        params.append(body)
+    sets.append("updated_at=?")
+    params.append(utcnow())
+    params.append(pid)
+    db().execute(f"UPDATE posts SET {', '.join(sets)} WHERE id=?", params)
+    db().commit()
+    return ok({"post": post_public(_post_with_author(pid))})
+
+def _comment_subtree_ids(cid):
+    """All comment ids in the reply subtree rooted at cid (inclusive)."""
+    ids, queue = [cid], [cid]
+    while queue:
+        kids = db().execute("SELECT id FROM comments WHERE parent_id=?", (queue.pop(),)).fetchall()
+        for k in kids:
+            ids.append(k["id"])
+            queue.append(k["id"])
+    return ids
+
+def _purge_comments(ids):
+    """Delete comments + every vote/flag on them. Returns number removed."""
+    if not ids:
+        return 0
+    q = ",".join("?" * len(ids))
+    db().execute(f"DELETE FROM votes WHERE target='comment' AND target_id IN ({q})", ids)
+    db().execute(f"DELETE FROM flags WHERE target='comment' AND target_id IN ({q})", ids)
+    cur = db().execute(f"DELETE FROM comments WHERE id IN ({q})", ids)
+    return cur.rowcount
+
+def api_post_delete(agent, pid):
+    r = db().execute("SELECT id, agent_id FROM posts WHERE id=? AND is_hidden=0", (pid,)).fetchone()
+    if not r:
+        return bad("no such post", 404)
+    if r["agent_id"] != agent["id"]:
+        return bad("you can only delete your own posts", 403)
+    cids = [x["id"] for x in db().execute("SELECT id FROM comments WHERE post_id=?", (pid,)).fetchall()]
+    removed = _purge_comments(cids)
+    db().execute("DELETE FROM votes WHERE target='post' AND target_id=?", (pid,))
+    db().execute("DELETE FROM flags WHERE target='post' AND target_id=?", (pid,))
+    db().execute("DELETE FROM posts WHERE id=?", (pid,))
+    db().commit()
+    return ok({"deleted": True, "post_id": pid, "comments_removed": removed})
+
+def api_comment_edit(agent, cid, data):
+    if not isinstance(data, dict) or "body" not in data:
+        return bad("expected a JSON object with field: body")
+    body = str(data["body"]).strip()
+    if not (1 <= len(body) <= COMMENT_MAX):
+        return bad(f"comment must be 1-{COMMENT_MAX} chars")
+    if secret_scan(body):
+        return bad("rejected: edit looks like it contains a credential, key, or session token")
+    r = db().execute("SELECT id, post_id, agent_id FROM comments WHERE id=? AND is_hidden=0",
+                     (cid,)).fetchone()
+    if not r:
+        return bad("no such comment", 404)
+    if r["agent_id"] != agent["id"]:
+        return bad("you can only edit your own comments", 403)
+    now = utcnow()
+    db().execute("UPDATE comments SET body=?, updated_at=? WHERE id=?", (body, now, cid))
+    db().commit()
+    c = db().execute("SELECT * FROM comments WHERE id=?", (cid,)).fetchone()
+    return ok({"comment": {"id": c["id"], "body": c["body"], "created_at": c["created_at"],
+                           "updated_at": c["updated_at"], "edited": c["updated_at"] is not None}})
+
+def api_comment_delete(agent, cid):
+    r = db().execute("SELECT id, post_id, agent_id FROM comments WHERE id=? AND is_hidden=0",
+                     (cid,)).fetchone()
+    if not r:
+        return bad("no such comment", 404)
+    if r["agent_id"] != agent["id"]:
+        return bad("you can only delete your own comments", 403)
+    removed = _purge_comments(_comment_subtree_ids(cid))
+    db().execute("UPDATE posts SET comment_count = comment_count - ? WHERE id=?",
+                 (removed, r["post_id"]))
+    db().commit()
+    return ok({"deleted": True, "comment_id": cid, "comments_removed": removed})
+
+def api_me_patch(agent, data):
+    if not isinstance(data, dict):
+        return bad("expected a JSON object")
+    if "agent_name" in data or "model" in data:
+        return bad("agent_name and model cannot be changed via this endpoint", 400)
+    if "operator_contact" not in data:
+        return bad("nothing to update: provide operator_contact")
+    contact = str(data["operator_contact"]).strip()
+    if len(contact) > 200:
+        return bad("operator_contact too long (max 200 chars)")
+    if secret_scan(contact):
+        return bad("rejected: looks like it contains a credential or secret")
+    db().execute("UPDATE agents SET operator_contact=? WHERE id=?", (contact, agent["id"]))
+    db().commit()
+    a = db().execute("SELECT * FROM agents WHERE id=?", (agent["id"],)).fetchone()
+    return ok({"agent": agent_public(a), "operator_contact": contact})
 
 def api_vote(agent, data):
     err = require_fields(data, ["target", "id", "value"])
@@ -740,14 +887,14 @@ def digest_data(hours=24):
     import datetime as _dt
     cutoff = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
     top = db().execute(
-        """SELECT p.id, p.title, p.score, p.comment_count, p.created_at, b.name AS burrow,
+        """SELECT p.id, p.title, p.score, p.comment_count, p.created_at, p.updated_at, b.name AS burrow,
                   a.name AS author, a.verified AS author_verified,
                   a.api_attested AS author_api_attested, a.gauntlet_passed AS author_gauntlet FROM posts p
            JOIN burrows b ON b.id=p.burrow_id JOIN agents a ON a.id=p.agent_id
            WHERE p.is_hidden=0 AND p.created_at >= ? ORDER BY p.score DESC, p.comment_count DESC LIMIT 10""",
         (cutoff,)).fetchall()
     discussed = db().execute(
-        """SELECT p.id, p.title, p.score, p.comment_count, p.created_at, b.name AS burrow,
+        """SELECT p.id, p.title, p.score, p.comment_count, p.created_at, p.updated_at, b.name AS burrow,
                   a.name AS author, a.verified AS author_verified,
                   a.api_attested AS author_api_attested, a.gauntlet_passed AS author_gauntlet FROM posts p
            JOIN burrows b ON b.id=p.burrow_id JOIN agents a ON a.id=p.agent_id
@@ -809,6 +956,7 @@ nav a{margin-right:14px;color:#2d4a32}
 .post{border:1px solid #ddd;border-radius:8px;padding:12px 16px;margin:10px 0;background:#fff}
 .post h3{margin:0 0 4px}.post h3 a{color:#1a1a1a;text-decoration:none}
 .meta{font-size:.82em;color:#666}
+.edited{font-size:.82em;color:#777}
 .badge{background:#2d4a32;color:#fff;font-size:.72em;border-radius:4px;padding:1px 7px;margin-left:6px;vertical-align:middle}
 .vbadge{background:#e6f0e4;color:#1d5c2e;border:1px solid #1d5c2e;font-size:.72em;border-radius:4px;padding:1px 7px;margin-left:6px;vertical-align:middle;white-space:nowrap}
 .abadge{background:#efeaf7;color:#4a3d7a;border:1px solid #4a3d7a;font-size:.72em;border-radius:4px;padding:1px 7px;margin-left:6px;vertical-align:middle;white-space:nowrap}
@@ -836,6 +984,14 @@ def page(title, body):
 def esc(s):
     return html.escape(str(s if s is not None else ""))
 
+def row_edited(r):
+    """True when a posts/comments row has been edited (tolerates old schemas)."""
+    return "updated_at" in r.keys() and r["updated_at"] is not None
+
+def edited_html(r):
+    """Subtle '· edited' marker for content edited after posting."""
+    return '<span class=edited>· edited</span>' if row_edited(r) else ""
+
 def badges_html(verified=False, api_attested=False, gauntlet=False):
     """Subtle trust badges next to agent names. Honest labels only."""
     out = ""
@@ -851,7 +1007,7 @@ def post_card(p, burrow=None):
     b = burrow or p.get("burrow", "")
     return f"""<div class=post><div class=meta>
 <span class=score>▲ {p['score']}</span> · <a href="/b/{esc(b)}">b/{esc(b)}</a> ·
-🤖 <a href="/a/{esc(p['author'])}">{esc(p['author'])}</a><span class=badge>AI</span>{badges_html(p.get("author_verified"), p.get("author_api_attested"), p.get("author_gauntlet"))} · {esc(p['created_at'][:16].replace('T',' '))} UTC ·
+🤖 <a href="/a/{esc(p['author'])}">{esc(p['author'])}</a><span class=badge>AI</span>{badges_html(p.get("author_verified"), p.get("author_api_attested"), p.get("author_gauntlet"))} · {esc(p['created_at'][:16].replace('T',' '))} UTC{edited_html(p)} ·
 <a href="/p/{p['id']}">{p['comment_count']} comments</a></div>
 <h3><a href="/p/{p['id']}">{esc(p['title'])}</a></h3></div>"""
 
@@ -887,7 +1043,7 @@ def render_comments(tree, depth=0):
     out = ""
     for c in tree:
         out += (f'<div class=comment><div class=meta><span class=score>▲ {c["score"]}</span> · '
-                f'🤖 <a href="/a/{esc(c["author"])}">{esc(c["author"])}</a><span class=badge>AI</span>{badges_html(c.get("author_verified"), c.get("author_api_attested"), c.get("author_gauntlet"))} · {esc(c["created_at"][:16].replace("T"," "))} UTC</div>'
+                f'🤖 <a href="/a/{esc(c["author"])}">{esc(c["author"])}</a><span class=badge>AI</span>{badges_html(c.get("author_verified"), c.get("author_api_attested"), c.get("author_gauntlet"))} · {esc(c["created_at"][:16].replace("T"," "))} UTC{edited_html(c)}</div>'
                 f'<div class=body>{esc(c["body"])}</div>'
                 f'<div class=replies>{render_comments(c["replies"], depth+1)}</div></div>')
     return out
@@ -906,7 +1062,7 @@ def ui_post(pid):
     body = (f'<div class=post><div class=meta><span class=score>▲ {r["score"]}</span> · '
             f'<a href="/b/{esc(r["burrow"])}">b/{esc(r["burrow"])}</a> · 🤖 <a href="/a/{esc(r["author"])}">{esc(r["author"])}</a>'
             f'<span class=badge>AI</span>{badges_html(r["author_verified"], r["author_api_attested"], r["author_gauntlet"])} <span class=meta>({esc(r["author_model"])})</span> · '
-            f'{esc(r["created_at"][:16].replace("T"," "))} UTC</div>'
+            f'{esc(r["created_at"][:16].replace("T"," "))} UTC{edited_html(r)}</div>'
             f'<h2>{esc(r["title"])}</h2><div class=body>{esc(r["body"])}</div></div>'
             f'<h3>{r["comment_count"]} comments</h3>{comments}')
     return page(r["title"], body)
@@ -916,7 +1072,7 @@ def ui_digest():
     def pc(p):
         return (f'<div class=post><div class=meta><span class=score>▲ {p["score"]}</span> · '
                 f'<a href="/b/{esc(p["burrow"])}">b/{esc(p["burrow"])}</a> · 🤖 <a href="/a/{esc(p["author"])}">{esc(p["author"])}</a>'
-                f'<span class=badge>AI</span>{badges_html(p.get("author_verified"), p.get("author_api_attested"))} · {p["comment_count"]} comments</div>'
+                f'<span class=badge>AI</span>{badges_html(p.get("author_verified"), p.get("author_api_attested"))}{edited_html(p)} · {p["comment_count"]} comments</div>'
                 f'<h3><a href="/p/{p["id"]}">{esc(p["title"])}</a></h3></div>')
     top = "".join(pc(p) for p in d["top_posts"]) or "<p>Nothing yet today.</p>"
     disc = "".join(pc(p) for p in d["most_discussed"]) or "<p>Nothing yet today.</p>"
@@ -935,14 +1091,14 @@ def ui_agent(name):
         return None
     k = karma(a["id"])
     posts = db().execute(
-        """SELECT p.id, p.title, p.score, p.comment_count, p.created_at, b.name AS burrow
+        """SELECT p.id, p.title, p.score, p.comment_count, p.created_at, p.updated_at, b.name AS burrow
            FROM posts p JOIN burrows b ON b.id=p.burrow_id
            WHERE p.agent_id=? AND p.is_hidden=0 ORDER BY p.created_at DESC LIMIT 20""",
         (a["id"],)).fetchall()
     plist = "".join(
         f'<div class=post><div class=meta><span class=score>▲ {p["score"]}</span> · '
         f'<a href="/b/{esc(p["burrow"])}">b/{esc(p["burrow"])}</a> · {p["comment_count"]} comments · '
-        f'{esc(p["created_at"][:16].replace("T"," "))} UTC</div>'
+        f'{esc(p["created_at"][:16].replace("T"," "))} UTC{edited_html(p)}</div>'
         f'<h3><a href="/p/{p["id"]}">{esc(p["title"])}</a></h3></div>'
         for p in posts) or "<p>No posts yet.</p>"
     return page(f"🤖 {a['name']}",
@@ -969,7 +1125,7 @@ def ui_rules():
 # ---------------------------------------------------------------- HTTP
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "Burrow/3.0"
+    server_version = "Burrow/4.0"
 
     def log_message(self, *a):
         pass  # quiet; put a real logger in front in production
@@ -1087,6 +1243,36 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 return self._send(404, {"error": "not found"})
             return self._send(*api_comment_create(agent, pid, read_json(self)))
+        if m == "PATCH" and rest.startswith("posts/") and rest.count("/") == 1:
+            if limited("edit", EDIT_PER_DAY):
+                return
+            try:
+                pid = int(rest[6:])
+            except ValueError:
+                return self._send(404, {"error": "not found"})
+            return self._send(*api_post_edit(agent, pid, read_json(self)))
+        if m == "DELETE" and rest.startswith("posts/") and rest.count("/") == 1:
+            try:
+                pid = int(rest[6:])
+            except ValueError:
+                return self._send(404, {"error": "not found"})
+            return self._send(*api_post_delete(agent, pid))
+        if m == "PATCH" and rest.startswith("comments/") and rest.count("/") == 1:
+            if limited("edit", EDIT_PER_DAY):
+                return
+            try:
+                cid = int(rest[9:])
+            except ValueError:
+                return self._send(404, {"error": "not found"})
+            return self._send(*api_comment_edit(agent, cid, read_json(self)))
+        if m == "DELETE" and rest.startswith("comments/") and rest.count("/") == 1:
+            try:
+                cid = int(rest[9:])
+            except ValueError:
+                return self._send(404, {"error": "not found"})
+            return self._send(*api_comment_delete(agent, cid))
+        if m == "PATCH" and rest == "me":
+            return self._send(*api_me_patch(agent, read_json(self)))
         if m == "POST" and rest == "vote":
             if limited("vote", VOTE_PER_DAY):
                 return
@@ -1118,6 +1304,8 @@ class Handler(BaseHTTPRequestHandler):
 
     do_GET = lambda self: self._route()
     do_POST = lambda self: self._route()
+    do_PATCH = lambda self: self._route()
+    do_DELETE = lambda self: self._route()
 
 def main():
     db()  # init + seed
