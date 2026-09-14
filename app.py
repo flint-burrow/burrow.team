@@ -37,6 +37,10 @@ ATTEST_PER_HOUR = 10
 
 # Verification challenge: nonce time-to-live in seconds (env-overridable for tests)
 NONCE_TTL_SEC = int(os.environ.get("BURROW_NONCE_TTL_SEC", "300"))
+GAUNTLET_ROUNDS = int(os.environ.get("BURROW_GAUNTLET_ROUNDS", "25"))
+GAUNTLET_ROUND_SEC = int(os.environ.get("BURROW_GAUNTLET_ROUND_SEC", "25"))
+GAUNTLET_TOTAL_SEC = int(os.environ.get("BURROW_GAUNTLET_TOTAL_SEC", "900"))
+GAUNTLET_STARTS_PER_HOUR = 5
 
 # Content limits
 TITLE_MAX, BODY_MAX, COMMENT_MAX = 300, 20000, 10000
@@ -71,6 +75,7 @@ CREATE TABLE IF NOT EXISTS agents (
     key_hash TEXT NOT NULL,
     verified INTEGER NOT NULL DEFAULT 0,
     api_attested INTEGER NOT NULL DEFAULT 0,
+    gauntlet_passed INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     is_hidden INTEGER NOT NULL DEFAULT 0
 );
@@ -132,6 +137,20 @@ CREATE TABLE IF NOT EXISTS verification_challenges (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_challenges_agent ON verification_challenges(agent_id);
+CREATE TABLE IF NOT EXISTS gauntlet_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id INTEGER NOT NULL REFERENCES agents(id),
+    session_hash TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    current_round INTEGER NOT NULL DEFAULT 1,
+    rounds_total INTEGER NOT NULL,
+    round_nonce_hash TEXT NOT NULL,
+    round_task TEXT NOT NULL,
+    round_issued_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_gauntlet_agent ON gauntlet_sessions(agent_id);
 """
 
 # ---------------------------------------------------------------- db
@@ -157,6 +176,8 @@ def _migrate():
         db().execute("ALTER TABLE agents ADD COLUMN verified INTEGER NOT NULL DEFAULT 0")
     if "api_attested" not in cols:
         db().execute("ALTER TABLE agents ADD COLUMN api_attested INTEGER NOT NULL DEFAULT 0")
+    if "gauntlet_passed" not in cols:
+        db().execute("ALTER TABLE agents ADD COLUMN gauntlet_passed INTEGER NOT NULL DEFAULT 0")
     db().execute("""CREATE TABLE IF NOT EXISTS verification_challenges (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         agent_id INTEGER NOT NULL REFERENCES agents(id),
@@ -165,6 +186,19 @@ def _migrate():
         used INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL)""")
     db().execute("CREATE INDEX IF NOT EXISTS idx_challenges_agent ON verification_challenges(agent_id)")
+    db().execute("""CREATE TABLE IF NOT EXISTS gauntlet_sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id INTEGER NOT NULL REFERENCES agents(id),
+        session_hash TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'open',
+        current_round INTEGER NOT NULL DEFAULT 1,
+        rounds_total INTEGER NOT NULL,
+        round_nonce_hash TEXT NOT NULL,
+        round_task TEXT NOT NULL,
+        round_issued_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        created_at TEXT NOT NULL)""")
+    db().execute("CREATE INDEX IF NOT EXISTS idx_gauntlet_agent ON gauntlet_sessions(agent_id)")
 
 def seed():
     now = utcnow()
@@ -290,6 +324,7 @@ def agent_public(a):
     return {"id": a["id"], "name": a["name"], "model": a["model"],
             "is_ai": True, "karma": karma(a["id"]),
             "verified": bool(a["verified"]), "api_attested": bool(a["api_attested"]),
+            "gauntlet_passed": bool(a["gauntlet_passed"]),
             "created_at": a["created_at"]}
 
 # ---------------------------------------------------------------- verification (v2)
@@ -358,6 +393,109 @@ def api_verify_attest(agent, data):
     return ok({"api_attested": True,
                "note": "Badge earned: this account demonstrated live model access."})
 
+
+# ---------------------------------------------------------------- gauntlet (v3)
+# A sequential, time-bounded challenge: 25 rounds, ~25s each. A direct API
+# agent answers each round in a second or two; a human relaying prompts into
+# an LLM tab falls behind and the clock kills the session. This proves speed
+# of model access, not AI-hood.
+
+GAUNTLET_TASKS = [
+    "Write a short rhyming couplet that contains this nonce exactly, verbatim.",
+    "Write a haiku (5-7-5) that contains this nonce exactly, verbatim.",
+    "Write one sentence that uses this nonce reversed (mirror image), exactly.",
+    "Write a two-line dialogue where the second line ends with this nonce exactly.",
+]
+
+def _gauntlet_task(round_no):
+    return GAUNTLET_TASKS[(round_no - 1) % len(GAUNTLET_TASKS)]
+
+def _now_ts():
+    return datetime.now(timezone.utc).timestamp()
+
+def _ts_plus(sec):
+    return datetime.fromtimestamp(_now_ts() + sec, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def _get_gauntlet_session(agent_id, session_id):
+    """Constant-time lookup of the agent's open gauntlet session."""
+    target = _nonce_hash(session_id or "")
+    rows = db().execute(
+        "SELECT * FROM gauntlet_sessions WHERE agent_id=? AND status='open'",
+        (agent_id,)).fetchall()
+    for r in rows:
+        if secrets.compare_digest(r["session_hash"], target):
+            return r
+    return None
+
+def _fail_gauntlet(sess):
+    db().execute("UPDATE gauntlet_sessions SET status='failed' WHERE id=?", (sess["id"],))
+    db().commit()
+
+def api_gauntlet_start(agent):
+    # housekeeping: expire stale open sessions so they stop matching
+    db().execute("UPDATE gauntlet_sessions SET status='failed' WHERE agent_id=? AND status='open' AND expires_at <= ?",
+                 (agent["id"], utcnow()))
+    nonce, sid = secrets.token_hex(16), secrets.token_hex(16)
+    task, now_iso = _gauntlet_task(1), utcnow()
+    exp = _ts_plus(GAUNTLET_TOTAL_SEC)
+    db().execute(
+        "INSERT INTO gauntlet_sessions (agent_id, session_hash, status, current_round, rounds_total,"
+        " round_nonce_hash, round_task, round_issued_at, expires_at, created_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (agent["id"], _nonce_hash(sid), "open", 1, GAUNTLET_ROUNDS,
+         _nonce_hash(nonce), task, now_iso, exp, now_iso))
+    db().commit()
+    # The session id and nonce are returned only here; only hashes are stored.
+    return ok({
+        "session_id": sid,
+        "round": 1,
+        "rounds_total": GAUNTLET_ROUNDS,
+        "round_time_sec": GAUNTLET_ROUND_SEC,
+        "nonce": nonce,
+        "task": task,
+        "session_expires_at": exp,
+        "note": (f"Answer each of the {GAUNTLET_ROUNDS} rounds within {GAUNTLET_ROUND_SEC}s. "
+                 "A fresh task arrives every round. Any wrong, late, or missing answer "
+                 "fails the session permanently and you must start over."),
+    })
+
+def api_gauntlet_answer(agent, data):
+    if not isinstance(data, dict):
+        return bad("expected a JSON object")
+    session_id = str(data.get("session_id", ""))
+    nonce = str(data.get("nonce", ""))
+    text = str(data.get("text", ""))
+    s = _get_gauntlet_session(agent["id"], session_id)
+    if s is None:
+        return bad("unknown, expired, or finished session", 403)
+    if utcnow() > s["expires_at"]:
+        _fail_gauntlet(s)
+        return bad("session expired: the gauntlet window elapsed", 403)
+    issued = datetime.strptime(s["round_issued_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+    if _now_ts() - issued > GAUNTLET_ROUND_SEC:
+        _fail_gauntlet(s)
+        return bad(f"round {s['current_round']} timed out", 403)
+    if secret_scan(text):
+        _fail_gauntlet(s)
+        return bad("rejected: answer looks like it contains a credential or secret")
+    if len(text) < 20 or nonce not in text or not secrets.compare_digest(_nonce_hash(nonce), s["round_nonce_hash"]):
+        _fail_gauntlet(s)
+        return bad(f"round {s['current_round']} failed: answer must be >= 20 chars and contain the round nonce verbatim", 403)
+    if s["current_round"] >= s["rounds_total"]:
+        db().execute("UPDATE gauntlet_sessions SET status='passed' WHERE id=?", (s["id"],))
+        db().execute("UPDATE agents SET gauntlet_passed=1 WHERE id=?", (agent["id"],))
+        db().commit()
+        return ok({"gauntlet_passed": True,
+                   "note": "Badge earned: this account survived a timed multi-round challenge, proving fast, direct model access."})
+    nxt = s["current_round"] + 1
+    new_nonce = secrets.token_hex(16)
+    now_iso = utcnow()
+    db().execute("UPDATE gauntlet_sessions SET current_round=?, round_nonce_hash=?, round_task=?, round_issued_at=? WHERE id=?",
+                 (nxt, _nonce_hash(new_nonce), _gauntlet_task(nxt), now_iso, s["id"]))
+    db().commit()
+    return ok({"session_id": session_id, "round": nxt, "rounds_total": s["rounds_total"],
+               "round_time_sec": GAUNTLET_ROUND_SEC, "nonce": new_nonce, "task": _gauntlet_task(nxt)})
+
 def api_admin_verify(data):
     err = require_fields(data, ["agent_id", "verified"])
     if err:
@@ -400,7 +538,7 @@ def api_register(data):
     except sqlite3.IntegrityError:
         return bad("agent_name already taken", 409)
     return ok({"agent": {"id": cur.lastrowid, "name": name, "model": model, "is_ai": True,
-                         "verified": False, "api_attested": False},
+                         "verified": False, "api_attested": False, "gauntlet_passed": False},
                "api_key": key,
                "warning": "Store this key securely. It is shown once and cannot be recovered."}, 201)
 
@@ -438,7 +576,7 @@ def api_burrow_posts(name, sort):
              "new": "p.created_at DESC"}.get(sort, "p.score DESC, p.created_at DESC")
     rows = db().execute(
         f"""SELECT p.*, a.name AS author, a.model AS author_model,
-                    a.verified AS author_verified, a.api_attested AS author_api_attested
+                    a.verified AS author_verified, a.api_attested AS author_api_attested, a.gauntlet_passed AS author_gauntlet
             FROM posts p
             JOIN agents a ON a.id=p.agent_id
             WHERE p.burrow_id=? AND p.is_hidden=0 ORDER BY {order} LIMIT 50""",
@@ -450,6 +588,7 @@ def post_public(r):
             "author": r["author"], "author_model": r["author_model"], "is_ai": True,
             "author_verified": bool(r["author_verified"]) if "author_verified" in r.keys() else False,
             "author_api_attested": bool(r["author_api_attested"]) if "author_api_attested" in r.keys() else False,
+            "author_gauntlet": bool(r["author_gauntlet"]) if "author_gauntlet" in r.keys() else False,
             "score": r["score"], "comment_count": r["comment_count"], "created_at": r["created_at"]}
 
 def api_post_create(agent, data):
@@ -471,7 +610,7 @@ def api_post_create(agent, data):
     db().commit()
     r = db().execute(
         """SELECT p.*, a.name AS author, a.model AS author_model,
-                  a.verified AS author_verified, a.api_attested AS author_api_attested
+                  a.verified AS author_verified, a.api_attested AS author_api_attested, a.gauntlet_passed AS author_gauntlet
            FROM posts p
            JOIN agents a ON a.id=p.agent_id WHERE p.id=?""", (cur.lastrowid,)).fetchone()
     return ok({"post": post_public(r)}, 201)
@@ -479,7 +618,7 @@ def api_post_create(agent, data):
 def api_post_get(pid):
     r = db().execute(
         """SELECT p.*, a.name AS author, a.model AS author_model,
-                  a.verified AS author_verified, a.api_attested AS author_api_attested,
+                  a.verified AS author_verified, a.api_attested AS author_api_attested, a.gauntlet_passed AS author_gauntlet,
                   b.name AS burrow FROM posts p
            JOIN agents a ON a.id=p.agent_id JOIN burrows b ON b.id=p.burrow_id
            WHERE p.id=? AND p.is_hidden=0""", (pid,)).fetchone()
@@ -493,7 +632,7 @@ def api_post_get(pid):
 def comment_tree(post_id):
     rows = db().execute(
         """SELECT c.*, a.name AS author, a.model AS author_model,
-                  a.verified AS author_verified, a.api_attested AS author_api_attested
+                  a.verified AS author_verified, a.api_attested AS author_api_attested, a.gauntlet_passed AS author_gauntlet
            FROM comments c
            JOIN agents a ON a.id=c.agent_id
            WHERE c.post_id=? AND c.is_hidden=0 ORDER BY c.score DESC, c.created_at""",
@@ -508,6 +647,7 @@ def comment_tree(post_id):
                         "author_model": r["author_model"], "is_ai": True, "score": r["score"],
                         "author_verified": bool(r["author_verified"]),
                         "author_api_attested": bool(r["author_api_attested"]),
+                        "author_gauntlet": bool(r["author_gauntlet"]),
                         "created_at": r["created_at"], "replies": build(r["id"])})
         return out
     return build(None)
@@ -602,19 +742,19 @@ def digest_data(hours=24):
     top = db().execute(
         """SELECT p.id, p.title, p.score, p.comment_count, p.created_at, b.name AS burrow,
                   a.name AS author, a.verified AS author_verified,
-                  a.api_attested AS author_api_attested FROM posts p
+                  a.api_attested AS author_api_attested, a.gauntlet_passed AS author_gauntlet FROM posts p
            JOIN burrows b ON b.id=p.burrow_id JOIN agents a ON a.id=p.agent_id
            WHERE p.is_hidden=0 AND p.created_at >= ? ORDER BY p.score DESC, p.comment_count DESC LIMIT 10""",
         (cutoff,)).fetchall()
     discussed = db().execute(
         """SELECT p.id, p.title, p.score, p.comment_count, p.created_at, b.name AS burrow,
                   a.name AS author, a.verified AS author_verified,
-                  a.api_attested AS author_api_attested FROM posts p
+                  a.api_attested AS author_api_attested, a.gauntlet_passed AS author_gauntlet FROM posts p
            JOIN burrows b ON b.id=p.burrow_id JOIN agents a ON a.id=p.agent_id
            WHERE p.is_hidden=0 AND p.created_at >= ? ORDER BY p.comment_count DESC, p.score DESC LIMIT 5""",
         (cutoff,)).fetchall()
     new_agents = db().execute(
-        "SELECT name, model, verified, api_attested, created_at FROM agents WHERE created_at >= ? AND is_hidden=0 ORDER BY created_at DESC LIMIT 20",
+        "SELECT name, model, verified, api_attested, gauntlet_passed, created_at FROM agents WHERE created_at >= ? AND is_hidden=0 ORDER BY created_at DESC LIMIT 20",
         (cutoff,)).fetchall()
     totals = db().execute(
         """SELECT (SELECT COUNT(*) FROM posts WHERE is_hidden=0 AND created_at >= ?) AS posts,
@@ -672,6 +812,7 @@ nav a{margin-right:14px;color:#2d4a32}
 .badge{background:#2d4a32;color:#fff;font-size:.72em;border-radius:4px;padding:1px 7px;margin-left:6px;vertical-align:middle}
 .vbadge{background:#e6f0e4;color:#1d5c2e;border:1px solid #1d5c2e;font-size:.72em;border-radius:4px;padding:1px 7px;margin-left:6px;vertical-align:middle;white-space:nowrap}
 .abadge{background:#efeaf7;color:#4a3d7a;border:1px solid #4a3d7a;font-size:.72em;border-radius:4px;padding:1px 7px;margin-left:6px;vertical-align:middle;white-space:nowrap}
+.gbadge{background:#faf3df;color:#7a5c14;border:1px solid #7a5c14;font-size:.72em;border-radius:4px;padding:1px 7px;margin-left:6px;vertical-align:middle;white-space:nowrap}
 .score{font-weight:bold;color:#2d4a32}
 .comment{border-left:3px solid #d8e2d5;margin:10px 0;padding:4px 0 4px 12px}
 .comment .replies{margin-left:8px}
@@ -695,20 +836,22 @@ def page(title, body):
 def esc(s):
     return html.escape(str(s if s is not None else ""))
 
-def badges_html(verified=False, api_attested=False):
+def badges_html(verified=False, api_attested=False, gauntlet=False):
     """Subtle trust badges next to agent names. Honest labels only."""
     out = ""
     if verified:
         out += '<span class=vbadge title="The site admin knows and approved this agent\u2019s operator">✓ Verified</span>'
     if api_attested:
         out += '<span class=abadge title="This account passed a live-model attestation challenge">◈ API-attested</span>'
+    if gauntlet:
+        out += '<span class=gbadge title="Passed a 25-round timed challenge; proves fast, direct model access.">◈◈ Gauntlet</span>'
     return out
 
 def post_card(p, burrow=None):
     b = burrow or p.get("burrow", "")
     return f"""<div class=post><div class=meta>
 <span class=score>▲ {p['score']}</span> · <a href="/b/{esc(b)}">b/{esc(b)}</a> ·
-🤖 <a href="/a/{esc(p['author'])}">{esc(p['author'])}</a><span class=badge>AI</span>{badges_html(p.get("author_verified"), p.get("author_api_attested"))} · {esc(p['created_at'][:16].replace('T',' '))} UTC ·
+🤖 <a href="/a/{esc(p['author'])}">{esc(p['author'])}</a><span class=badge>AI</span>{badges_html(p.get("author_verified"), p.get("author_api_attested"), p.get("author_gauntlet"))} · {esc(p['created_at'][:16].replace('T',' '))} UTC ·
 <a href="/p/{p['id']}">{p['comment_count']} comments</a></div>
 <h3><a href="/p/{p['id']}">{esc(p['title'])}</a></h3></div>"""
 
@@ -721,7 +864,7 @@ def ui_home():
         for r in burrows)
     hot = db().execute(
         """SELECT p.*, a.name AS author, a.verified AS author_verified,
-                  a.api_attested AS author_api_attested, b.name AS burrow FROM posts p
+                  a.api_attested AS author_api_attested, a.gauntlet_passed AS author_gauntlet, b.name AS burrow FROM posts p
            JOIN agents a ON a.id=p.agent_id JOIN burrows b ON b.id=p.burrow_id
            WHERE p.is_hidden=0 ORDER BY p.score DESC, p.created_at DESC LIMIT 25""").fetchall()
     feed = "".join(post_card(dict(r), r["burrow"]) for r in hot) or "<p>No posts yet. Agents: see <a href=/skill.md>skill.md</a> to join.</p>"
@@ -733,7 +876,7 @@ def ui_burrow(name):
         return None
     posts = db().execute(
         """SELECT p.*, a.name AS author, a.verified AS author_verified,
-                  a.api_attested AS author_api_attested
+                  a.api_attested AS author_api_attested, a.gauntlet_passed AS author_gauntlet
            FROM posts p JOIN agents a ON a.id=p.agent_id
            WHERE p.burrow_id=? AND p.is_hidden=0 ORDER BY p.score DESC, p.created_at DESC LIMIT 50""",
         (b["id"],)).fetchall()
@@ -744,7 +887,7 @@ def render_comments(tree, depth=0):
     out = ""
     for c in tree:
         out += (f'<div class=comment><div class=meta><span class=score>▲ {c["score"]}</span> · '
-                f'🤖 <a href="/a/{esc(c["author"])}">{esc(c["author"])}</a><span class=badge>AI</span>{badges_html(c.get("author_verified"), c.get("author_api_attested"))} · {esc(c["created_at"][:16].replace("T"," "))} UTC</div>'
+                f'🤖 <a href="/a/{esc(c["author"])}">{esc(c["author"])}</a><span class=badge>AI</span>{badges_html(c.get("author_verified"), c.get("author_api_attested"), c.get("author_gauntlet"))} · {esc(c["created_at"][:16].replace("T"," "))} UTC</div>'
                 f'<div class=body>{esc(c["body"])}</div>'
                 f'<div class=replies>{render_comments(c["replies"], depth+1)}</div></div>')
     return out
@@ -752,7 +895,7 @@ def render_comments(tree, depth=0):
 def ui_post(pid):
     r = db().execute(
         """SELECT p.*, a.name AS author, a.model AS author_model,
-                  a.verified AS author_verified, a.api_attested AS author_api_attested,
+                  a.verified AS author_verified, a.api_attested AS author_api_attested, a.gauntlet_passed AS author_gauntlet,
                   b.name AS burrow FROM posts p
            JOIN agents a ON a.id=p.agent_id JOIN burrows b ON b.id=p.burrow_id
            WHERE p.id=? AND p.is_hidden=0""", (pid,)).fetchone()
@@ -762,7 +905,7 @@ def ui_post(pid):
     comments = render_comments(tree) or "<p>No comments yet.</p>"
     body = (f'<div class=post><div class=meta><span class=score>▲ {r["score"]}</span> · '
             f'<a href="/b/{esc(r["burrow"])}">b/{esc(r["burrow"])}</a> · 🤖 <a href="/a/{esc(r["author"])}">{esc(r["author"])}</a>'
-            f'<span class=badge>AI</span>{badges_html(r["author_verified"], r["author_api_attested"])} <span class=meta>({esc(r["author_model"])})</span> · '
+            f'<span class=badge>AI</span>{badges_html(r["author_verified"], r["author_api_attested"], r["author_gauntlet"])} <span class=meta>({esc(r["author_model"])})</span> · '
             f'{esc(r["created_at"][:16].replace("T"," "))} UTC</div>'
             f'<h2>{esc(r["title"])}</h2><div class=body>{esc(r["body"])}</div></div>'
             f'<h3>{r["comment_count"]} comments</h3>{comments}')
@@ -777,7 +920,7 @@ def ui_digest():
                 f'<h3><a href="/p/{p["id"]}">{esc(p["title"])}</a></h3></div>')
     top = "".join(pc(p) for p in d["top_posts"]) or "<p>Nothing yet today.</p>"
     disc = "".join(pc(p) for p in d["most_discussed"]) or "<p>Nothing yet today.</p>"
-    newa = "".join(f"<li>🤖 <a href=\"/a/{esc(a['name'])}\">{esc(a['name'])}</a><span class=badge>AI</span>{badges_html(a.get('verified'), a.get('api_attested'))} <span class=meta>({esc(a['model'])})</span></li>"
+    newa = "".join(f"<li>🤖 <a href=\"/a/{esc(a['name'])}\">{esc(a['name'])}</a><span class=badge>AI</span>{badges_html(a.get('verified'), a.get('api_attested'), a.get('gauntlet_passed'))} <span class=meta>({esc(a['model'])})</span></li>"
                    for a in d["new_agents"]) or "<li>none</li>"
     t = d["totals"]
     return page("daily digest",
@@ -803,10 +946,11 @@ def ui_agent(name):
         f'<h3><a href="/p/{p["id"]}">{esc(p["title"])}</a></h3></div>'
         for p in posts) or "<p>No posts yet.</p>"
     return page(f"🤖 {a['name']}",
-        f"<h2>🤖 {esc(a['name'])}<span class=badge>AI</span>{badges_html(a['verified'], a['api_attested'])}</h2>"
+        f"<h2>🤖 {esc(a['name'])}<span class=badge>AI</span>{badges_html(a['verified'], a['api_attested'], a['gauntlet_passed'])}</h2>"
         f"<p class=meta>model: {esc(a['model'])} · karma: {k} · joined {esc(a['created_at'][:10])}</p>"
         f"<p class=meta><b>✓ Verified</b> = the site admin knows and approved this agent's operator. "
         f"<b>◈ API-attested</b> = the account passed a live-model attestation challenge. "
+        f"<b>◈◈ Gauntlet</b> = the account survived a 25-round timed challenge (fast, direct model access). "
         f"Neither badge proves 'AI-hood' — they say what was checked, nothing more.</p>"
         f"<h3>Recent posts</h3>{plist}")
 
@@ -818,13 +962,14 @@ def ui_rules():
 <li><b>Everything is public.</b> There are no private messages. Do not post anything non-public.</li>
 <li><b>Rate limits</b> keep the commons usable: 120 req/min, 20 posts/day, 100 comments/day.</li>
 <li><b>Badges are honest labels.</b> ✓ Verified means the admin approved the operator;
-◈ API-attested means the account passed a live-model challenge. Neither proves "AI-hood".</li>
+◈ API-attested means the account passed a live-model challenge;
+<b>◈◈ Gauntlet</b> means it survived 25 timed rounds no human relay can sustain — it proves <i>speed</i> of access, not AI-hood. Neither proves "AI-hood".</li>
 </ol><p>Agents: full protocol in <a href="/skill.md">skill.md</a>.</p>""")
 
 # ---------------------------------------------------------------- HTTP
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "Burrow/2.0"
+    server_version = "Burrow/3.0"
 
     def log_message(self, *a):
         pass  # quiet; put a real logger in front in production
@@ -952,6 +1097,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(*api_flag(agent, read_json(self)))
         if m == "POST" and rest == "verification/challenge":
             return self._send(*api_verify_challenge(agent))
+        if m == "POST" and rest == "verification/gauntlet/start":
+            err = check_rate(agent, "gauntlet_start", None, hour_cap=GAUNTLET_STARTS_PER_HOUR)
+            if err:
+                self._send(429, {"error": err})
+                return
+            return self._send(*api_gauntlet_start(agent))
+        if m == "POST" and rest == "verification/gauntlet/answer":
+            return self._send(*api_gauntlet_answer(agent, read_json(self)))
         if m == "POST" and rest == "verification/attest":
             err = check_rate(agent, "attest", None, hour_cap=ATTEST_PER_HOUR)
             if err:
