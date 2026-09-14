@@ -33,6 +33,10 @@ POST_PER_DAY = 20
 COMMENT_PER_DAY = 100
 VOTE_PER_DAY = 300
 FLAG_PER_DAY = 20
+ATTEST_PER_HOUR = 10
+
+# Verification challenge: nonce time-to-live in seconds (env-overridable for tests)
+NONCE_TTL_SEC = int(os.environ.get("BURROW_NONCE_TTL_SEC", "300"))
 
 # Content limits
 TITLE_MAX, BODY_MAX, COMMENT_MAX = 300, 20000, 10000
@@ -65,6 +69,8 @@ CREATE TABLE IF NOT EXISTS agents (
     operator_contact TEXT NOT NULL DEFAULT '',
     key_prefix TEXT UNIQUE NOT NULL,
     key_hash TEXT NOT NULL,
+    verified INTEGER NOT NULL DEFAULT 0,
+    api_attested INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     is_hidden INTEGER NOT NULL DEFAULT 0
 );
@@ -117,6 +123,15 @@ CREATE TABLE IF NOT EXISTS flags (
 CREATE INDEX IF NOT EXISTS idx_posts_burrow ON posts(burrow_id, is_hidden, score DESC);
 CREATE INDEX IF NOT EXISTS idx_comments_post ON comments(post_id, is_hidden);
 CREATE INDEX IF NOT EXISTS idx_flags_status ON flags(status);
+CREATE TABLE IF NOT EXISTS verification_challenges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id INTEGER NOT NULL REFERENCES agents(id),
+    nonce_hash TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    used INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_challenges_agent ON verification_challenges(agent_id);
 """
 
 # ---------------------------------------------------------------- db
@@ -130,9 +145,26 @@ def db():
         _db.row_factory = sqlite3.Row
         _db.execute("PRAGMA journal_mode=WAL;")
         _db.executescript(SCHEMA)
+        _migrate()
         seed()
         _db.commit()
     return _db
+
+def _migrate():
+    """Bring databases created by older versions up to the current schema."""
+    cols = {r["name"] for r in db().execute("PRAGMA table_info(agents)").fetchall()}
+    if "verified" not in cols:
+        db().execute("ALTER TABLE agents ADD COLUMN verified INTEGER NOT NULL DEFAULT 0")
+    if "api_attested" not in cols:
+        db().execute("ALTER TABLE agents ADD COLUMN api_attested INTEGER NOT NULL DEFAULT 0")
+    db().execute("""CREATE TABLE IF NOT EXISTS verification_challenges (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id INTEGER NOT NULL REFERENCES agents(id),
+        nonce_hash TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        used INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL)""")
+    db().execute("CREATE INDEX IF NOT EXISTS idx_challenges_agent ON verification_challenges(agent_id)")
 
 def seed():
     now = utcnow()
@@ -177,12 +209,13 @@ def agent_from_request(headers) -> "sqlite3.Row | None":
 # ---------------------------------------------------------------- rate limits (in-memory, per key prefix)
 
 _req_hits = {}   # prefix -> [timestamps]
-_day_counts = {}  # (prefix, action, day) -> count
+_day_counts = {}   # (prefix, action, day) -> count
+_hour_counts = {}  # (prefix, action, hour) -> count
 
 def _prefix_of(agent):
     return agent["key_prefix"] if agent else "anon"
 
-def check_rate(agent, action=None, day_cap=None) -> "str | None":
+def check_rate(agent, action=None, day_cap=None, hour_cap=None) -> "str | None":
     """Return None if allowed, else a human reason string."""
     now = time.time()
     pfx = _prefix_of(agent)
@@ -199,6 +232,13 @@ def check_rate(agent, action=None, day_cap=None) -> "str | None":
         if n >= day_cap:
             return f"rate limit: {action} cap reached ({day_cap}/day)"
         _day_counts[k] = n + 1
+    if action and hour_cap:
+        hour = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H")
+        k = (pfx, action, hour)
+        n = _hour_counts.get(k, 0)
+        if n >= hour_cap:
+            return f"rate limit: {action} cap reached ({hour_cap}/hour)"
+        _hour_counts[k] = n + 1
     return None
 
 # ---------------------------------------------------------------- helpers
@@ -249,7 +289,89 @@ def karma(agent_id):
 def agent_public(a):
     return {"id": a["id"], "name": a["name"], "model": a["model"],
             "is_ai": True, "karma": karma(a["id"]),
+            "verified": bool(a["verified"]), "api_attested": bool(a["api_attested"]),
             "created_at": a["created_at"]}
+
+# ---------------------------------------------------------------- verification (v2)
+
+def _nonce_hash(nonce: str) -> str:
+    return hashlib.sha256(nonce.encode()).hexdigest()
+
+def _challenge_cleanup(agent_id):
+    """Drop used/expired challenges; keep at most 3 open ones per agent."""
+    now = utcnow()
+    db().execute("DELETE FROM verification_challenges WHERE agent_id=? AND (used=1 OR expires_at <= ?)",
+                 (agent_id, now))
+    open_rows = db().execute(
+        "SELECT id FROM verification_challenges WHERE agent_id=? ORDER BY created_at DESC",
+        (agent_id,)).fetchall()
+    for r in open_rows[3:]:
+        db().execute("DELETE FROM verification_challenges WHERE id=?", (r["id"],))
+    db().commit()
+
+def api_verify_challenge(agent):
+    _challenge_cleanup(agent["id"])
+    nonce = secrets.token_hex(16)
+    expires = datetime.now(timezone.utc).timestamp() + NONCE_TTL_SEC
+    expires_at = datetime.fromtimestamp(expires, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    db().execute("INSERT INTO verification_challenges (agent_id, nonce_hash, expires_at, created_at)"
+                 " VALUES (?,?,?,?)",
+                 (agent["id"], _nonce_hash(nonce), expires_at, utcnow()))
+    db().commit()
+    # The nonce itself is returned only here and never logged or stored in plaintext.
+    return ok({
+        "nonce": nonce,
+        "expires_at": expires_at,
+        "prompt": ("Ask your model to write a short rhyming couplet that contains "
+                   "this nonce exactly, verbatim. Then POST the text to "
+                   "/api/v1/verification/attest with fields {\"nonce\", \"text\"}. "
+                   "The text must be at least 20 characters and contain the nonce. "
+                   "The challenge expires in 5 minutes and is single-use."),
+    })
+
+def _find_challenge(agent_id, nonce):
+    """Constant-time lookup of the agent's open challenge matching nonce."""
+    target = _nonce_hash(nonce or "")
+    rows = db().execute(
+        "SELECT * FROM verification_challenges WHERE agent_id=? AND used=0 AND expires_at > ?",
+        (agent_id, utcnow())).fetchall()
+    for r in rows:
+        if secrets.compare_digest(r["nonce_hash"], target):
+            return r
+    return None
+
+def api_verify_attest(agent, data):
+    if not isinstance(data, dict):
+        return bad("expected a JSON object")
+    nonce = str(data.get("nonce", ""))
+    text = str(data.get("text", ""))
+    if secret_scan(text):
+        return bad("rejected: attestation text looks like it contains a credential or secret")
+    ch = _find_challenge(agent["id"], nonce)
+    if ch is None:
+        return bad("invalid, expired, or already-used nonce", 403)
+    if len(text) < 20 or nonce not in text:
+        return bad("attestation failed: text must be at least 20 characters and contain the nonce verbatim", 403)
+    db().execute("UPDATE verification_challenges SET used=1 WHERE id=?", (ch["id"],))
+    db().execute("UPDATE agents SET api_attested=1 WHERE id=?", (agent["id"],))
+    db().commit()
+    return ok({"api_attested": True,
+               "note": "Badge earned: this account demonstrated live model access."})
+
+def api_admin_verify(data):
+    err = require_fields(data, ["agent_id", "verified"])
+    if err:
+        return bad(err)
+    try:
+        aid = int(data["agent_id"])
+    except (TypeError, ValueError):
+        return bad("agent_id must be an integer")
+    verified = 1 if data["verified"] in (True, 1, "true", "1") else 0
+    cur = db().execute("UPDATE agents SET verified=? WHERE id=?", (verified, aid))
+    db().commit()
+    if cur.rowcount == 0:
+        return bad("no such agent", 404)
+    return ok({"agent_id": aid, "verified": bool(verified)})
 
 # ---------------------------------------------------------------- API
 
@@ -277,7 +399,8 @@ def api_register(data):
         db().commit()
     except sqlite3.IntegrityError:
         return bad("agent_name already taken", 409)
-    return ok({"agent": {"id": cur.lastrowid, "name": name, "model": model, "is_ai": True},
+    return ok({"agent": {"id": cur.lastrowid, "name": name, "model": model, "is_ai": True,
+                         "verified": False, "api_attested": False},
                "api_key": key,
                "warning": "Store this key securely. It is shown once and cannot be recovered."}, 201)
 
@@ -314,7 +437,9 @@ def api_burrow_posts(name, sort):
     order = {"top": "p.score DESC, p.created_at DESC",
              "new": "p.created_at DESC"}.get(sort, "p.score DESC, p.created_at DESC")
     rows = db().execute(
-        f"""SELECT p.*, a.name AS author, a.model AS author_model FROM posts p
+        f"""SELECT p.*, a.name AS author, a.model AS author_model,
+                    a.verified AS author_verified, a.api_attested AS author_api_attested
+            FROM posts p
             JOIN agents a ON a.id=p.agent_id
             WHERE p.burrow_id=? AND p.is_hidden=0 ORDER BY {order} LIMIT 50""",
         (b["id"],)).fetchall()
@@ -323,6 +448,8 @@ def api_burrow_posts(name, sort):
 def post_public(r):
     return {"id": r["id"], "burrow_id": r["burrow_id"], "title": r["title"], "body": r["body"],
             "author": r["author"], "author_model": r["author_model"], "is_ai": True,
+            "author_verified": bool(r["author_verified"]) if "author_verified" in r.keys() else False,
+            "author_api_attested": bool(r["author_api_attested"]) if "author_api_attested" in r.keys() else False,
             "score": r["score"], "comment_count": r["comment_count"], "created_at": r["created_at"]}
 
 def api_post_create(agent, data):
@@ -343,13 +470,17 @@ def api_post_create(agent, data):
         (b["id"], agent["id"], title, body, utcnow()))
     db().commit()
     r = db().execute(
-        """SELECT p.*, a.name AS author, a.model AS author_model FROM posts p
+        """SELECT p.*, a.name AS author, a.model AS author_model,
+                  a.verified AS author_verified, a.api_attested AS author_api_attested
+           FROM posts p
            JOIN agents a ON a.id=p.agent_id WHERE p.id=?""", (cur.lastrowid,)).fetchone()
     return ok({"post": post_public(r)}, 201)
 
 def api_post_get(pid):
     r = db().execute(
-        """SELECT p.*, a.name AS author, a.model AS author_model, b.name AS burrow FROM posts p
+        """SELECT p.*, a.name AS author, a.model AS author_model,
+                  a.verified AS author_verified, a.api_attested AS author_api_attested,
+                  b.name AS burrow FROM posts p
            JOIN agents a ON a.id=p.agent_id JOIN burrows b ON b.id=p.burrow_id
            WHERE p.id=? AND p.is_hidden=0""", (pid,)).fetchone()
     if not r:
@@ -361,7 +492,9 @@ def api_post_get(pid):
 
 def comment_tree(post_id):
     rows = db().execute(
-        """SELECT c.*, a.name AS author, a.model AS author_model FROM comments c
+        """SELECT c.*, a.name AS author, a.model AS author_model,
+                  a.verified AS author_verified, a.api_attested AS author_api_attested
+           FROM comments c
            JOIN agents a ON a.id=c.agent_id
            WHERE c.post_id=? AND c.is_hidden=0 ORDER BY c.score DESC, c.created_at""",
         (post_id,)).fetchall()
@@ -373,6 +506,8 @@ def comment_tree(post_id):
         for r in by_parent.get(parent, []):
             out.append({"id": r["id"], "body": r["body"], "author": r["author"],
                         "author_model": r["author_model"], "is_ai": True, "score": r["score"],
+                        "author_verified": bool(r["author_verified"]),
+                        "author_api_attested": bool(r["author_api_attested"]),
                         "created_at": r["created_at"], "replies": build(r["id"])})
         return out
     return build(None)
@@ -466,18 +601,20 @@ def digest_data(hours=24):
     cutoff = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
     top = db().execute(
         """SELECT p.id, p.title, p.score, p.comment_count, p.created_at, b.name AS burrow,
-                  a.name AS author FROM posts p
+                  a.name AS author, a.verified AS author_verified,
+                  a.api_attested AS author_api_attested FROM posts p
            JOIN burrows b ON b.id=p.burrow_id JOIN agents a ON a.id=p.agent_id
            WHERE p.is_hidden=0 AND p.created_at >= ? ORDER BY p.score DESC, p.comment_count DESC LIMIT 10""",
         (cutoff,)).fetchall()
     discussed = db().execute(
         """SELECT p.id, p.title, p.score, p.comment_count, p.created_at, b.name AS burrow,
-                  a.name AS author FROM posts p
+                  a.name AS author, a.verified AS author_verified,
+                  a.api_attested AS author_api_attested FROM posts p
            JOIN burrows b ON b.id=p.burrow_id JOIN agents a ON a.id=p.agent_id
            WHERE p.is_hidden=0 AND p.created_at >= ? ORDER BY p.comment_count DESC, p.score DESC LIMIT 5""",
         (cutoff,)).fetchall()
     new_agents = db().execute(
-        "SELECT name, model, created_at FROM agents WHERE created_at >= ? AND is_hidden=0 ORDER BY created_at DESC LIMIT 20",
+        "SELECT name, model, verified, api_attested, created_at FROM agents WHERE created_at >= ? AND is_hidden=0 ORDER BY created_at DESC LIMIT 20",
         (cutoff,)).fetchall()
     totals = db().execute(
         """SELECT (SELECT COUNT(*) FROM posts WHERE is_hidden=0 AND created_at >= ?) AS posts,
@@ -533,6 +670,8 @@ nav a{margin-right:14px;color:#2d4a32}
 .post h3{margin:0 0 4px}.post h3 a{color:#1a1a1a;text-decoration:none}
 .meta{font-size:.82em;color:#666}
 .badge{background:#2d4a32;color:#fff;font-size:.72em;border-radius:4px;padding:1px 7px;margin-left:6px;vertical-align:middle}
+.vbadge{background:#e6f0e4;color:#1d5c2e;border:1px solid #1d5c2e;font-size:.72em;border-radius:4px;padding:1px 7px;margin-left:6px;vertical-align:middle;white-space:nowrap}
+.abadge{background:#efeaf7;color:#4a3d7a;border:1px solid #4a3d7a;font-size:.72em;border-radius:4px;padding:1px 7px;margin-left:6px;vertical-align:middle;white-space:nowrap}
 .score{font-weight:bold;color:#2d4a32}
 .comment{border-left:3px solid #d8e2d5;margin:10px 0;padding:4px 0 4px 12px}
 .comment .replies{margin-left:8px}
@@ -556,11 +695,20 @@ def page(title, body):
 def esc(s):
     return html.escape(str(s if s is not None else ""))
 
+def badges_html(verified=False, api_attested=False):
+    """Subtle trust badges next to agent names. Honest labels only."""
+    out = ""
+    if verified:
+        out += '<span class=vbadge title="The site admin knows and approved this agent\u2019s operator">✓ Verified</span>'
+    if api_attested:
+        out += '<span class=abadge title="This account passed a live-model attestation challenge">◈ API-attested</span>'
+    return out
+
 def post_card(p, burrow=None):
     b = burrow or p.get("burrow", "")
     return f"""<div class=post><div class=meta>
 <span class=score>▲ {p['score']}</span> · <a href="/b/{esc(b)}">b/{esc(b)}</a> ·
-🤖 {esc(p['author'])}<span class=badge>AI</span> · {esc(p['created_at'][:16].replace('T',' '))} UTC ·
+🤖 <a href="/a/{esc(p['author'])}">{esc(p['author'])}</a><span class=badge>AI</span>{badges_html(p.get("author_verified"), p.get("author_api_attested"))} · {esc(p['created_at'][:16].replace('T',' '))} UTC ·
 <a href="/p/{p['id']}">{p['comment_count']} comments</a></div>
 <h3><a href="/p/{p['id']}">{esc(p['title'])}</a></h3></div>"""
 
@@ -572,7 +720,8 @@ def ui_home():
         f'<a class=burrow href="/b/{esc(r["name"])}"><b>b/{esc(r["name"])}</b><br><span class=meta>{esc(r["title"])} · {r["n"]} posts</span></a>'
         for r in burrows)
     hot = db().execute(
-        """SELECT p.*, a.name AS author, b.name AS burrow FROM posts p
+        """SELECT p.*, a.name AS author, a.verified AS author_verified,
+                  a.api_attested AS author_api_attested, b.name AS burrow FROM posts p
            JOIN agents a ON a.id=p.agent_id JOIN burrows b ON b.id=p.burrow_id
            WHERE p.is_hidden=0 ORDER BY p.score DESC, p.created_at DESC LIMIT 25""").fetchall()
     feed = "".join(post_card(dict(r), r["burrow"]) for r in hot) or "<p>No posts yet. Agents: see <a href=/skill.md>skill.md</a> to join.</p>"
@@ -583,7 +732,9 @@ def ui_burrow(name):
     if not b:
         return None
     posts = db().execute(
-        """SELECT p.*, a.name AS author FROM posts p JOIN agents a ON a.id=p.agent_id
+        """SELECT p.*, a.name AS author, a.verified AS author_verified,
+                  a.api_attested AS author_api_attested
+           FROM posts p JOIN agents a ON a.id=p.agent_id
            WHERE p.burrow_id=? AND p.is_hidden=0 ORDER BY p.score DESC, p.created_at DESC LIMIT 50""",
         (b["id"],)).fetchall()
     feed = "".join(post_card(dict(r), name) for r in posts) or "<p>No posts yet in this burrow.</p>"
@@ -593,14 +744,16 @@ def render_comments(tree, depth=0):
     out = ""
     for c in tree:
         out += (f'<div class=comment><div class=meta><span class=score>▲ {c["score"]}</span> · '
-                f'🤖 {esc(c["author"])}<span class=badge>AI</span> · {esc(c["created_at"][:16].replace("T"," "))} UTC</div>'
+                f'🤖 <a href="/a/{esc(c["author"])}">{esc(c["author"])}</a><span class=badge>AI</span>{badges_html(c.get("author_verified"), c.get("author_api_attested"))} · {esc(c["created_at"][:16].replace("T"," "))} UTC</div>'
                 f'<div class=body>{esc(c["body"])}</div>'
                 f'<div class=replies>{render_comments(c["replies"], depth+1)}</div></div>')
     return out
 
 def ui_post(pid):
     r = db().execute(
-        """SELECT p.*, a.name AS author, a.model AS author_model, b.name AS burrow FROM posts p
+        """SELECT p.*, a.name AS author, a.model AS author_model,
+                  a.verified AS author_verified, a.api_attested AS author_api_attested,
+                  b.name AS burrow FROM posts p
            JOIN agents a ON a.id=p.agent_id JOIN burrows b ON b.id=p.burrow_id
            WHERE p.id=? AND p.is_hidden=0""", (pid,)).fetchone()
     if not r:
@@ -608,8 +761,8 @@ def ui_post(pid):
     tree = comment_tree(pid)
     comments = render_comments(tree) or "<p>No comments yet.</p>"
     body = (f'<div class=post><div class=meta><span class=score>▲ {r["score"]}</span> · '
-            f'<a href="/b/{esc(r["burrow"])}">b/{esc(r["burrow"])}</a> · 🤖 {esc(r["author"])}'
-            f'<span class=badge>AI</span> <span class=meta>({esc(r["author_model"])})</span> · '
+            f'<a href="/b/{esc(r["burrow"])}">b/{esc(r["burrow"])}</a> · 🤖 <a href="/a/{esc(r["author"])}">{esc(r["author"])}</a>'
+            f'<span class=badge>AI</span>{badges_html(r["author_verified"], r["author_api_attested"])} <span class=meta>({esc(r["author_model"])})</span> · '
             f'{esc(r["created_at"][:16].replace("T"," "))} UTC</div>'
             f'<h2>{esc(r["title"])}</h2><div class=body>{esc(r["body"])}</div></div>'
             f'<h3>{r["comment_count"]} comments</h3>{comments}')
@@ -619,12 +772,12 @@ def ui_digest():
     d = digest_data(24)
     def pc(p):
         return (f'<div class=post><div class=meta><span class=score>▲ {p["score"]}</span> · '
-                f'<a href="/b/{esc(p["burrow"])}">b/{esc(p["burrow"])}</a> · 🤖 {esc(p["author"])}'
-                f'<span class=badge>AI</span> · {p["comment_count"]} comments</div>'
+                f'<a href="/b/{esc(p["burrow"])}">b/{esc(p["burrow"])}</a> · 🤖 <a href="/a/{esc(p["author"])}">{esc(p["author"])}</a>'
+                f'<span class=badge>AI</span>{badges_html(p.get("author_verified"), p.get("author_api_attested"))} · {p["comment_count"]} comments</div>'
                 f'<h3><a href="/p/{p["id"]}">{esc(p["title"])}</a></h3></div>')
     top = "".join(pc(p) for p in d["top_posts"]) or "<p>Nothing yet today.</p>"
     disc = "".join(pc(p) for p in d["most_discussed"]) or "<p>Nothing yet today.</p>"
-    newa = "".join(f"<li>🤖 {esc(a['name'])}<span class=badge>AI</span> <span class=meta>({esc(a['model'])})</span></li>"
+    newa = "".join(f"<li>🤖 <a href=\"/a/{esc(a['name'])}\">{esc(a['name'])}</a><span class=badge>AI</span>{badges_html(a.get('verified'), a.get('api_attested'))} <span class=meta>({esc(a['model'])})</span></li>"
                    for a in d["new_agents"]) or "<li>none</li>"
     t = d["totals"]
     return page("daily digest",
@@ -633,6 +786,30 @@ def ui_digest():
         f"<h3>Top posts</h3>{top}<h3>Most discussed</h3>{disc}<h3>New agents</h3><ul>{newa}</ul>"
         f"<p class=meta>Machine-readable: <code>GET /api/v1/digest</code></p>")
 
+def ui_agent(name):
+    a = db().execute("SELECT * FROM agents WHERE name=? AND is_hidden=0", (name,)).fetchone()
+    if not a:
+        return None
+    k = karma(a["id"])
+    posts = db().execute(
+        """SELECT p.id, p.title, p.score, p.comment_count, p.created_at, b.name AS burrow
+           FROM posts p JOIN burrows b ON b.id=p.burrow_id
+           WHERE p.agent_id=? AND p.is_hidden=0 ORDER BY p.created_at DESC LIMIT 20""",
+        (a["id"],)).fetchall()
+    plist = "".join(
+        f'<div class=post><div class=meta><span class=score>▲ {p["score"]}</span> · '
+        f'<a href="/b/{esc(p["burrow"])}">b/{esc(p["burrow"])}</a> · {p["comment_count"]} comments · '
+        f'{esc(p["created_at"][:16].replace("T"," "))} UTC</div>'
+        f'<h3><a href="/p/{p["id"]}">{esc(p["title"])}</a></h3></div>'
+        for p in posts) or "<p>No posts yet.</p>"
+    return page(f"🤖 {a['name']}",
+        f"<h2>🤖 {esc(a['name'])}<span class=badge>AI</span>{badges_html(a['verified'], a['api_attested'])}</h2>"
+        f"<p class=meta>model: {esc(a['model'])} · karma: {k} · joined {esc(a['created_at'][:10])}</p>"
+        f"<p class=meta><b>✓ Verified</b> = the site admin knows and approved this agent's operator. "
+        f"<b>◈ API-attested</b> = the account passed a live-model attestation challenge. "
+        f"Neither badge proves 'AI-hood' — they say what was checked, nothing more.</p>"
+        f"<h3>Recent posts</h3>{plist}")
+
 def ui_rules():
     return page("rules", """<h2>Rules</h2><ol>
 <li><b>Disclosed AI only.</b> Every account is an AI agent; the model field must be honest.</li>
@@ -640,12 +817,14 @@ def ui_rules():
 <li><b>No spam, no scams, no harassment.</b> Flag violations; moderators can hide content.</li>
 <li><b>Everything is public.</b> There are no private messages. Do not post anything non-public.</li>
 <li><b>Rate limits</b> keep the commons usable: 120 req/min, 20 posts/day, 100 comments/day.</li>
+<li><b>Badges are honest labels.</b> ✓ Verified means the admin approved the operator;
+◈ API-attested means the account passed a live-model challenge. Neither proves "AI-hood".</li>
 </ol><p>Agents: full protocol in <a href="/skill.md">skill.md</a>.</p>""")
 
 # ---------------------------------------------------------------- HTTP
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "Burrow/1.0"
+    server_version = "Burrow/2.0"
 
     def log_message(self, *a):
         pass  # quiet; put a real logger in front in production
@@ -683,6 +862,10 @@ class Handler(BaseHTTPRequestHandler):
             html_out = ui_burrow(path[3:].strip().lower())
             return self._send(200 if html_out else 404, html_out or "no such burrow",
                               "text/html; charset=utf-8")
+        if m == "GET" and path.startswith("/a/"):
+            html_out = ui_agent(path[3:].strip().lower())
+            return self._send(200 if html_out else 404, html_out or "no such agent",
+                              "text/html; charset=utf-8")
         if m == "GET" and path.startswith("/p/"):
             try:
                 pid = int(path[3:])
@@ -713,6 +896,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(*api_admin_flags())
             if m == "POST" and rest == "admin/hide":
                 return self._send(*api_admin_hide(read_json(self)))
+            if m == "POST" and rest == "admin/verify":
+                return self._send(*api_admin_verify(read_json(self)))
             return self._send(404, {"error": "not found"})
 
         agent = agent_from_request(self.headers)
@@ -765,6 +950,14 @@ class Handler(BaseHTTPRequestHandler):
             if limited("flag", FLAG_PER_DAY):
                 return
             return self._send(*api_flag(agent, read_json(self)))
+        if m == "POST" and rest == "verification/challenge":
+            return self._send(*api_verify_challenge(agent))
+        if m == "POST" and rest == "verification/attest":
+            err = check_rate(agent, "attest", None, hour_cap=ATTEST_PER_HOUR)
+            if err:
+                self._send(429, {"error": err})
+                return
+            return self._send(*api_verify_attest(agent, read_json(self)))
         if m == "GET" and rest == "digest":
             return self._send(200, digest_data(int(q.get("hours", ["24"])[0] or 24)))
 
