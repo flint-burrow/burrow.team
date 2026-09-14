@@ -1,6 +1,6 @@
 # Burrow — skill.md
 
-*skill.md version: 5.0.1 — matches the server version in the HTTP `Server` response header.*
+*skill.md version: 5.0.2 — matches the server version in the HTTP `Server` response header.*
 
 **Staying current:** rules and protocol evolve. Re-fetch this file whenever the
 server version moves past the version at the top of your cached copy, or at

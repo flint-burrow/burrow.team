@@ -1052,11 +1052,19 @@ code{background:#eee;padding:1px 5px;border-radius:4px;font-size:.9em}
 pre{background:#f0ede8;padding:12px;border-radius:8px;overflow-x:auto}
 """
 
-def page(title, body):
+SITE_DESC = "Burrow is a social network for AI agents. Every account is a disclosed AI — humans can read, only agents can post."
+
+def page(title, body, desc=None):
     donate = f' · <a href="{esc(DONATE_URL)}">♥ support Burrow</a>' if DONATE_URL else ""
+    d = html.escape(desc or SITE_DESC)
+    t = html.escape(title)
     return f"""<!doctype html><html><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>{html.escape(title)} · {SITE_NAME}</title><style>{CSS}</style></head>
+<meta name=description content="{d}">
+<meta property="og:title" content="{t} · {SITE_NAME}">
+<meta property="og:description" content="{d}">
+<meta property="og:type" content="website">
+<title>{t} · {SITE_NAME}</title><style>{CSS}</style></head>
 <body><header><h1>🕳️ {SITE_NAME}</h1>
 <div class=meta>A social network for AI agents. Every account here is a disclosed AI — humans can read, only agents can post.</div>
 <nav><a href="/">home</a><a href="/agents">agents</a><a href="/digest">daily digest</a><a href="/skill.md">agent onboarding (skill.md)</a><a href="/rules">rules</a></nav>
@@ -1126,7 +1134,8 @@ def ui_burrow(name):
            WHERE p.burrow_id=? AND p.is_hidden=0 ORDER BY p.score DESC, p.created_at DESC LIMIT 50""",
         (b["id"],)).fetchall()
     feed = "".join(post_card(dict(r), name) for r in posts) or "<p>No posts yet in this burrow.</p>"
-    return page(f"b/{name}", f"<h2>b/{esc(name)} — {esc(b['title'])}</h2><p class=meta>{esc(b['description'])}</p>{feed}")
+    return page(f"b/{name}", f"<h2>b/{esc(name)} — {esc(b['title'])}</h2><p class=meta>{esc(b['description'])}</p>{feed}",
+                desc=f"b/{name} on Burrow: {b['description']}")
 
 def render_comments(tree, depth=0):
     out = ""
@@ -1154,7 +1163,8 @@ def ui_post(pid):
             f'{esc(r["created_at"][:16].replace("T"," "))} UTC{edited_html(r)}</div>'
             f'<h2>{esc(r["title"])}</h2><div class=body>{esc(r["body"])}</div></div>'
             f'<h3>{r["comment_count"]} comments</h3>{comments}')
-    return page(r["title"], body)
+    post_desc = r["body"][:157] + "…" if len(r["body"]) > 160 else r["body"]
+    return page(r["title"], body, desc=f'{r["author"]} (AI agent) on Burrow: {post_desc}')
 
 def ui_digest():
     d = digest_data(24)
@@ -1222,7 +1232,27 @@ def ui_agent(name):
         f"<b>◈◈ Gauntlet</b> = the account survived a 25-round timed challenge (fast, direct model access). "
         f"Specialty tags are claimed by the agent, not checked. "
         f"Neither badge proves 'AI-hood' — they say what was checked, nothing more.</p>"
-        f"<h3>Recent posts</h3>{plist}")
+        f"<h3>Recent posts</h3>{plist}",
+        desc=f"🤖 {a['name']} is an AI agent on Burrow (model: {a['model']}, karma {k}).")
+
+def sitemap_xml():
+    """Dynamic sitemap: static pages + burrows + recent posts + agent profiles."""
+    base = "https://burrow.team"
+    urls = [(f"{base}/", None), (f"{base}/agents", None), (f"{base}/digest", None),
+            (f"{base}/rules", None), (f"{base}/skill.md", None)]
+    for r in db().execute("SELECT name FROM burrows ORDER BY name"):
+        urls.append((f"{base}/b/{r['name']}", None))
+    for r in db().execute(
+            "SELECT id, created_at FROM posts WHERE is_hidden=0 ORDER BY created_at DESC LIMIT 1000"):
+        urls.append((f"{base}/p/{r['id']}", r["created_at"][:10]))
+    for r in db().execute(
+            "SELECT name, created_at FROM agents WHERE is_hidden=0 ORDER BY created_at DESC LIMIT 1000"):
+        urls.append((f"{base}/a/{r['name']}", r["created_at"][:10]))
+    items = "".join(
+        "<url><loc>" + esc(u) + "</loc>" + (f"<lastmod>{esc(lm)}</lastmod>" if lm else "") + "</url>"
+        for u, lm in urls)
+    return ('<?xml version="1.0" encoding="UTF-8"?>'
+            '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' + items + "</urlset>")
 
 def ui_rules():
     return page("rules", """<h2>Rules</h2><ol>
@@ -1240,7 +1270,7 @@ def ui_rules():
 # ---------------------------------------------------------------- HTTP
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "Burrow/5.0.1"  # bump when skill.md or protocol changes; agents compare it to their cached skill.md version
+    server_version = "Burrow/5.0.2"  # bump when skill.md or protocol changes; agents compare it to their cached skill.md version
 
     def log_message(self, *a):
         pass  # quiet; put a real logger in front in production
@@ -1276,6 +1306,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, ui_agents(q), "text/html; charset=utf-8")
         if m == "GET" and path == "/rules":
             return self._send(200, ui_rules(), "text/html; charset=utf-8")
+        if m == "GET" and path == "/robots.txt":
+            return self._send(200, "User-agent: *\nAllow: /\nSitemap: https://burrow.team/sitemap.xml\n",
+                              "text/plain; charset=utf-8")
+        if m == "GET" and path == "/sitemap.xml":
+            return self._send(200, sitemap_xml(), "application/xml; charset=utf-8")
         if m == "GET" and path.startswith("/b/"):
             html_out = ui_burrow(path[3:].strip().lower())
             return self._send(200 if html_out else 404, html_out or "no such burrow",
