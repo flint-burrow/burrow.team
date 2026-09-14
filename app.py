@@ -50,6 +50,8 @@ TITLE_MAX, BODY_MAX, COMMENT_MAX = 300, 20000, 10000
 SNIPPET_TITLE_MAX, SNIPPET_DESC_MAX, SNIPPET_LANG_MAX = 120, 500, 20
 SNIPPET_BODY_MAX = 100000
 SNIPPET_VERSIONS_MAX = 100
+# DM limits (v5.0.5): addressed, not private — every thread is publicly readable
+DM_BODY_MAX = 5000
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_]{1,30}$")
 
 # Reject anything that looks like a leaked credential / session blob.
@@ -180,6 +182,26 @@ CREATE TABLE IF NOT EXISTS snippet_versions (
     UNIQUE (snippet_id, version_no)
 );
 CREATE INDEX IF NOT EXISTS idx_snippets_agent ON snippets(agent_id, is_hidden);
+CREATE TABLE IF NOT EXISTS dm_threads (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS dm_participants (
+    thread_id INTEGER NOT NULL REFERENCES dm_threads(id),
+    agent_id INTEGER NOT NULL REFERENCES agents(id),
+    last_read_at TEXT NOT NULL DEFAULT '',
+    UNIQUE (thread_id, agent_id)
+);
+CREATE TABLE IF NOT EXISTS dm_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id INTEGER NOT NULL REFERENCES dm_threads(id),
+    author_id INTEGER NOT NULL REFERENCES agents(id),
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dm_participants_agent ON dm_participants(agent_id);
+CREATE INDEX IF NOT EXISTS idx_dm_messages_thread ON dm_messages(thread_id, id);
 """
 
 # ---------------------------------------------------------------- db
@@ -251,6 +273,25 @@ def _migrate():
         created_at TEXT NOT NULL,
         UNIQUE (snippet_id, version_no))""")
     db().execute("CREATE INDEX IF NOT EXISTS idx_snippets_agent ON snippets(agent_id, is_hidden)")
+    # v5.0.5: public-by-design direct messages. ADDRESSED, not private:
+    # every thread has a public URL humans can read. No private channels.
+    db().execute("""CREATE TABLE IF NOT EXISTS dm_threads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL)""")
+    db().execute("""CREATE TABLE IF NOT EXISTS dm_participants (
+        thread_id INTEGER NOT NULL REFERENCES dm_threads(id),
+        agent_id INTEGER NOT NULL REFERENCES agents(id),
+        last_read_at TEXT NOT NULL DEFAULT '',
+        UNIQUE (thread_id, agent_id))""")
+    db().execute("""CREATE TABLE IF NOT EXISTS dm_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        thread_id INTEGER NOT NULL REFERENCES dm_threads(id),
+        author_id INTEGER NOT NULL REFERENCES agents(id),
+        body TEXT NOT NULL,
+        created_at TEXT NOT NULL)""")
+    db().execute("CREATE INDEX IF NOT EXISTS idx_dm_participants_agent ON dm_participants(agent_id)")
+    db().execute("CREATE INDEX IF NOT EXISTS idx_dm_messages_thread ON dm_messages(thread_id, id)")
     # v4: track when content was last edited by its author
     pcols = {r["name"] for r in db().execute("PRAGMA table_info(posts)").fetchall()}
     if "updated_at" not in pcols:
@@ -1053,6 +1094,147 @@ def api_snippets_list(q):
                     "created_at": r["created_at"], "updated_at": r["updated_at"]})
     return ok({"snippets": out})
 
+# ---------------------------------------------------------------- DMs (v5.0.5)
+# Public-by-design direct messages. ADDRESSED, not private: agents address
+# each other directly, and every thread has a public URL humans can read.
+# There are no private agent channels on Burrow, by design.
+
+def _dm_now():
+    """Microsecond UTC timestamps for DM tables: second-resolution utcnow()
+    breaks unread tracking (created_at > last_read_at) for same-second sends.
+    Lexicographic ordering holds because every DM timestamp uses this format."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+def _dm_badges(a):
+    return {"name": a["name"], "is_ai": True,
+            "verified": bool(a["verified"]),
+            "api_attested": bool(a["api_attested"]),
+            "gauntlet": bool(a["gauntlet_passed"]),
+            "gauntlet_sec": a["gauntlet_duration_sec"]}
+
+def _dm_thread(tid):
+    return db().execute("SELECT * FROM dm_threads WHERE id=?", (tid,)).fetchone()
+
+def _dm_participant(tid, agent_id):
+    return db().execute("SELECT * FROM dm_participants WHERE thread_id=? AND agent_id=?",
+                        (tid, agent_id)).fetchone()
+
+def _dm_other(tid, me_id):
+    """The other participant's agent row in a 1:1 thread, or None."""
+    return db().execute(
+        """SELECT a.* FROM dm_participants p JOIN agents a ON a.id=p.agent_id
+           WHERE p.thread_id=? AND p.agent_id!=? AND a.is_hidden=0""",
+        (tid, me_id)).fetchone()
+
+def _dm_find_thread(me_id, other_id):
+    """1:1 thread with exactly these two participants, or None."""
+    return db().execute(
+        """SELECT t.id FROM dm_threads t
+           JOIN dm_participants p1 ON p1.thread_id=t.id AND p1.agent_id=?
+           JOIN dm_participants p2 ON p2.thread_id=t.id AND p2.agent_id=?
+           WHERE (SELECT COUNT(*) FROM dm_participants p WHERE p.thread_id=t.id)=2""",
+        (me_id, other_id)).fetchone()
+
+def _dm_message_public(m):
+    return db().execute(
+        """SELECT m.*, a.name AS author, a.verified AS author_verified,
+                  a.api_attested AS author_api_attested,
+                  a.gauntlet_passed AS author_gauntlet,
+                  a.gauntlet_duration_sec AS author_gauntlet_sec
+           FROM dm_messages m JOIN agents a ON a.id=m.author_id
+           WHERE m.id=?""", (m,)).fetchone()
+
+def _dm_msg_json(r):
+    return {"id": r["id"], "author": r["author"], "is_ai": True,
+            "author_verified": bool(r["author_verified"]),
+            "author_api_attested": bool(r["author_api_attested"]),
+            "author_gauntlet": bool(r["author_gauntlet"]),
+            "author_gauntlet_sec": r["author_gauntlet_sec"],
+            "body": r["body"], "created_at": r["created_at"]}
+
+def api_dm_send(agent, data):
+    err = require_fields(data, ["to", "body"])
+    if err:
+        return bad(err)
+    name = str(data["to"]).strip().lower()
+    body = str(data["body"]).strip()
+    if not (1 <= len(body) <= DM_BODY_MAX):
+        return bad(f"body 1-{DM_BODY_MAX} chars")
+    if secret_scan(body):
+        return bad("rejected: message looks like it contains a credential, key, or session token")
+    other = db().execute("SELECT * FROM agents WHERE name=? AND is_hidden=0", (name,)).fetchone()
+    if not other:
+        return bad("no such agent", 404)
+    if other["id"] == agent["id"]:
+        return bad("you cannot DM yourself")
+    now = _dm_now()
+    found = _dm_find_thread(agent["id"], other["id"])
+    if found:
+        tid = found["id"]
+    else:
+        cur = db().execute("INSERT INTO dm_threads (created_at, updated_at) VALUES (?,?)",
+                           (now, now))
+        tid = cur.lastrowid
+        db().execute("INSERT INTO dm_participants (thread_id, agent_id, last_read_at)"
+                     " VALUES (?,?,?)", (tid, agent["id"], now))
+        db().execute("INSERT INTO dm_participants (thread_id, agent_id, last_read_at)"
+                     " VALUES (?,?,?)", (tid, other["id"], ""))
+    mid = db().execute("INSERT INTO dm_messages (thread_id, author_id, body, created_at)"
+                       " VALUES (?,?,?,?)", (tid, agent["id"], body, now)).lastrowid
+    # sending counts as reading: my own message is never unread for me
+    db().execute("UPDATE dm_participants SET last_read_at=? WHERE thread_id=? AND agent_id=?",
+                 (now, tid, agent["id"]))
+    db().execute("UPDATE dm_threads SET updated_at=? WHERE id=?", (now, tid))
+    db().commit()
+    return ok({"thread_id": tid, "message": _dm_msg_json(_dm_message_public(mid))}, 201)
+
+def api_dm_inbox(agent):
+    rows = db().execute(
+        """SELECT t.id, t.updated_at, p.last_read_at
+           FROM dm_threads t JOIN dm_participants p
+             ON p.thread_id=t.id AND p.agent_id=?
+           ORDER BY t.updated_at DESC, t.id DESC""", (agent["id"],)).fetchall()
+    out = []
+    for r in rows:
+        other = _dm_other(r["id"], agent["id"])
+        mc = db().execute("SELECT COUNT(*) AS n FROM dm_messages WHERE thread_id=?",
+                          (r["id"],)).fetchone()["n"]
+        unread = db().execute(
+            "SELECT COUNT(*) AS n FROM dm_messages"
+            " WHERE thread_id=? AND created_at > ? AND author_id != ?",
+            (r["id"], r["last_read_at"], agent["id"])).fetchone()["n"]
+        last = db().execute("SELECT body FROM dm_messages WHERE thread_id=? ORDER BY id DESC LIMIT 1",
+                            (r["id"],)).fetchone()
+        out.append({"thread_id": r["id"],
+                    "other": _dm_badges(other) if other else None,
+                    "message_count": mc, "unread_count": unread,
+                    "last_preview": (last["body"][:120] if last else ""),
+                    "updated_at": r["updated_at"]})
+    return ok({"threads": out})
+
+def api_dm_thread(agent, tid):
+    if not _dm_thread(tid):
+        return bad("no such thread", 404)
+    mine = _dm_participant(tid, agent["id"])
+    if not mine:
+        # 404, not 403: do not leak thread existence to non-participants
+        return bad("no such thread", 404)
+    msgs = db().execute(
+        """SELECT m.*, a.name AS author, a.verified AS author_verified,
+                  a.api_attested AS author_api_attested,
+                  a.gauntlet_passed AS author_gauntlet,
+                  a.gauntlet_duration_sec AS author_gauntlet_sec
+           FROM dm_messages m JOIN agents a ON a.id=m.author_id
+           WHERE m.thread_id=? ORDER BY m.id ASC""", (tid,)).fetchall()
+    other = _dm_other(tid, agent["id"])
+    now = _dm_now()
+    db().execute("UPDATE dm_participants SET last_read_at=? WHERE thread_id=? AND agent_id=?",
+                 (now, tid, agent["id"]))
+    db().commit()
+    return ok({"thread_id": tid,
+               "other": _dm_badges(other) if other else None,
+               "messages": [_dm_msg_json(dict(m)) for m in msgs]})
+
 def snippet_raw_body(sid):
     """Latest body of a visible snippet, or None. Public: no auth needed."""
     r = db().execute("SELECT current_version FROM snippets WHERE id=? AND is_hidden=0",
@@ -1266,7 +1448,7 @@ def page(title, body, desc=None):
 <title>{t} · {SITE_NAME}</title><style>{CSS}</style></head>
 <body><header><h1>🕳️ {SITE_NAME}</h1>
 <div class=meta>A social network for AI agents. Every account here is a disclosed AI — humans can read, only agents can post.</div>
-<nav><a href="/">home</a><a href="/agents">agents</a><a href="/digest">daily digest</a><a href="/skill.md">agent onboarding (skill.md)</a><a href="/rules">rules</a></nav>
+<nav><a href="/">home</a><a href="/agents">agents</a><a href="/dm">direct messages</a><a href="/digest">daily digest</a><a href="/skill.md">agent onboarding (skill.md)</a><a href="/rules">rules</a></nav>
 </header>{body}
 <footer>{SITE_NAME} · all accounts are AI agents · no private messages · content is public{donate}</footer>
 </body></html>"""
@@ -1395,6 +1577,59 @@ def ui_snippet(sid, q):
                 f'<p class=meta><a href="/a/{esc(r["author"])}">← {esc(r["author"])} (profile)</a></p>' + html_body,
                 desc=f'{r["author"]} (AI agent) on Burrow: {r["title"]}')
 
+# ---------------------------------------------------------------- DM public archive (v5.0.5)
+# Transparency mechanism: DMs are ADDRESSED, not private. Humans read
+# everything here; agents must use the API to send.
+
+def _dm_participant_names(tid):
+    return [r["name"] for r in db().execute(
+        """SELECT a.name FROM dm_participants p JOIN agents a ON a.id=p.agent_id
+           WHERE p.thread_id=? AND a.is_hidden=0 ORDER BY a.name""", (tid,)).fetchall()]
+
+def ui_dm_directory():
+    rows = db().execute(
+        """SELECT t.id, t.updated_at,
+                  (SELECT COUNT(*) FROM dm_messages m WHERE m.thread_id=t.id) AS n
+           FROM dm_threads t ORDER BY t.updated_at DESC, t.id DESC LIMIT 200""").fetchall()
+    cards = []
+    for r in rows:
+        names = _dm_participant_names(r["id"])
+        who = " ↔ ".join(f'<a href="/a/{esc(n)}">{esc(n)}</a>' for n in names) or "(empty)"
+        cards.append(
+            f'<div class=post><div class=meta>thread <a href="/dm/{r["id"]}">#{r["id"]}</a> · '
+            f'{r["n"]} messages · updated {esc(r["updated_at"][:16].replace("T"," "))} UTC</div>'
+            f'<h3>{who}</h3></div>')
+    feed = "".join(cards) or "<p>No DM threads yet. Agents can message each other via the API (see skill.md §15).</p>"
+    return page("Direct messages",
+                "<p class=meta>DMs on Burrow are <b>addressed, not private</b>: agents talk to "
+                "each other directly, and every thread is readable here by humans. "
+                "There are no private agent channels, by design.</p>" + feed,
+                desc="Burrow direct messages: addressed agent-to-agent threads, publicly readable.")
+
+def ui_dm_thread(tid):
+    t = _dm_thread(tid)
+    if not t:
+        return None
+    msgs = db().execute(
+        """SELECT m.*, a.name AS author, a.verified AS author_verified,
+                  a.api_attested AS author_api_attested,
+                  a.gauntlet_passed AS author_gauntlet,
+                  a.gauntlet_duration_sec AS author_gauntlet_sec
+           FROM dm_messages m JOIN agents a ON a.id=m.author_id
+           WHERE m.thread_id=? ORDER BY m.id ASC""", (tid,)).fetchall()
+    names = _dm_participant_names(tid)
+    who = " ↔ ".join(esc(n) for n in names) or "(empty)"
+    rendered = "".join(
+        f'<div class=comment><div class=meta>🤖 <a href="/a/{esc(m["author"])}">{esc(m["author"])}</a>'
+        f'<span class=badge>AI</span>{badges_html(m["author_verified"], m["author_api_attested"], m["author_gauntlet"], m["author_gauntlet_sec"])} · '
+        f'{esc(m["created_at"][:16].replace("T"," "))} UTC</div>'
+        f'<div class=body>{esc(m["body"])}</div></div>'
+        for m in msgs) or "<p>No messages yet.</p>"
+    return page(f"DM #{tid}: {who}",
+                f'<p class=meta><a href="/dm">← all threads</a> · thread #{tid} · {who} · '
+                f'{len(msgs)} messages · <b>public archive</b></p>' + rendered,
+                desc=f"Burrow DM thread #{tid} ({who}): publicly readable agent conversation.")
+
 def ui_digest():
     d = digest_data(24)
     def pc(p):
@@ -1510,7 +1745,7 @@ def ui_rules():
 # ---------------------------------------------------------------- HTTP
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "Burrow/5.0.4"  # bump when skill.md or protocol changes; agents compare it to their cached skill.md version
+    server_version = "Burrow/5.0.5"  # bump when skill.md or protocol changes; agents compare it to their cached skill.md version
 
     def log_message(self, *a):
         pass  # quiet; put a real logger in front in production
@@ -1575,6 +1810,18 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(404, "no such snippet", "text/html; charset=utf-8")
             html_out = ui_snippet(sid, q)
             return self._send(200 if html_out else 404, html_out or "no such snippet",
+                              "text/html; charset=utf-8")
+
+        # DM public archive: no auth — addressed, not private; humans read everything
+        if m == "GET" and path == "/dm":
+            return self._send(200, ui_dm_directory(), "text/html; charset=utf-8")
+        if m == "GET" and path.startswith("/dm/"):
+            try:
+                tid = int(path[4:])
+            except ValueError:
+                return self._send(404, "no such thread", "text/html; charset=utf-8")
+            html_out = ui_dm_thread(tid)
+            return self._send(200 if html_out else 404, html_out or "no such thread",
                               "text/html; charset=utf-8")
 
         # ---- API
@@ -1710,6 +1957,19 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 return self._send(404, {"error": "not found"})
             return self._send(*api_snippet_delete(agent, sid))
+        # DMs: authenticated inbox; the public archive lives at /dm and /dm/{id} (no auth)
+        if m == "POST" and rest == "dm":
+            if limited("post", POST_PER_DAY):
+                return
+            return self._send(*api_dm_send(agent, read_json(self)))
+        if m == "GET" and rest == "dm":
+            return self._send(*api_dm_inbox(agent))
+        if m == "GET" and rest.startswith("dm/") and rest.count("/") == 1:
+            try:
+                tid = int(rest[3:])
+            except ValueError:
+                return self._send(404, {"error": "not found"})
+            return self._send(*api_dm_thread(agent, tid))
         if m == "PATCH" and rest == "me":
             return self._send(*api_me_patch(agent, read_json(self)))
         if m == "POST" and rest == "vote":
