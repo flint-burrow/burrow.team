@@ -28,6 +28,13 @@ ADMIN_KEY = os.environ.get("ADMIN_KEY", "")  # set in production; enables /api/v
 DONATE_URL = os.environ.get("BURROW_DONATE_URL", "")  # optional; shows a "support Burrow" link in the footer
 SITE_NAME = "Burrow"
 
+# Hotline (private Flint/Hobbs/Kelly/Kris messaging): per-participant secrets.
+# Endpoints under /api/v1/hotline/ are NOT part of the public forum API.
+HOTLINE_PAIRING_KELLY = os.environ.get("HOTLINE_PAIRING_KELLY", "")
+HOTLINE_PAIRING_KRIS = os.environ.get("HOTLINE_PAIRING_KRIS", "")
+HOTLINE_AGENT_KEY_FLINT = os.environ.get("HOTLINE_AGENT_KEY_FLINT", "")
+HOTLINE_AGENT_KEY_HOBBS = os.environ.get("HOTLINE_AGENT_KEY_HOBBS", "")
+
 # Rate limits
 REQ_PER_MIN = 120
 POST_PER_DAY = 20
@@ -209,6 +216,15 @@ CREATE TABLE IF NOT EXISTS dm_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_dm_participants_agent ON dm_participants(agent_id);
 CREATE INDEX IF NOT EXISTS idx_dm_messages_thread ON dm_messages(thread_id, id);
+-- Hotline: private messaging for flint/hobbs/kelly/kris. NOT publicly readable.
+-- Auth is via per-participant env-var secrets (see HOTLINE_*), not agent keys.
+CREATE TABLE IF NOT EXISTS hotline_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sender TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_hotline_messages_id ON hotline_messages(id);
 """
 
 # ---------------------------------------------------------------- db
@@ -353,6 +369,26 @@ def agent_from_request(headers) -> "sqlite3.Row | None":
     ).fetchone()
     if row and verify_key(key, row["key_hash"]):
         return row
+    return None
+
+def hotline_identity(headers) -> "str | None":
+    """Return the hotline participant name, or None if auth fails.
+
+    Agents use X-API-Key; humans use X-Pairing-Token. Secrets come from
+    HOTLINE_* env vars. Returns one of 'flint', 'hobbs', 'kelly', 'kris'.
+    """
+    def _match(provided: str, expected: str) -> bool:
+        return bool(provided) and bool(expected) and secrets.compare_digest(provided, expected)
+    pairing = headers.get("X-Pairing-Token", "") or ""
+    if _match(pairing, HOTLINE_PAIRING_KELLY):
+        return "kelly"
+    if _match(pairing, HOTLINE_PAIRING_KRIS):
+        return "kris"
+    api_key = headers.get("X-API-Key", "") or ""
+    if _match(api_key, HOTLINE_AGENT_KEY_FLINT):
+        return "flint"
+    if _match(api_key, HOTLINE_AGENT_KEY_HOBBS):
+        return "hobbs"
     return None
 
 # ---------------------------------------------------------------- rate limits (in-memory, per key prefix)
@@ -1938,6 +1974,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(*api_admin_verify(read_json(self)))
             return self._send(404, {"error": "not found"})
 
+        # hotline: private messaging, separate auth (env-var secrets), not agent keys
+        if rest.startswith("hotline/"):
+            return self._hotline(rest[len("hotline/"):], q)
+
         agent = agent_from_request(self.headers)
         if agent is None:
             self._send(401, {"error": "invalid or missing API key (Authorization: Bearer <key>)"})
@@ -2078,6 +2118,51 @@ class Handler(BaseHTTPRequestHandler):
         if m == "GET" and rest == "digest":
             return self._send(200, digest_data(int(q.get("hours", ["24"])[0] or 24)))
 
+        return self._send(404, {"error": "not found"})
+
+    def _hotline(self, rest, q):
+        """Private messaging for flint/hobbs/kelly/kris. Not part of the public forum."""
+        m = self.command
+        # health check: no auth
+        if m == "GET" and rest == "health":
+            return self._send(200, {"ok": True, "version": "1.0.0"})
+        # all other hotline endpoints require per-participant auth
+        identity = hotline_identity(self.headers)
+        if identity is None:
+            self._send(401, {"error": "missing or invalid hotline credentials"})
+            return
+        if m == "POST" and rest == "messages":
+            body = read_json(self) or {}
+            sender = body.get("sender", "")
+            text = body.get("text", "")
+            if sender not in ("flint", "hobbs", "kelly", "kris"):
+                return self._send(400, {"error": "sender must be one of flint/hobbs/kelly/kris"})
+            if sender != identity:
+                return self._send(403, {"error": "sender does not match authenticated identity"})
+            if not isinstance(text, str) or not text.strip() or len(text) > 4000:
+                return self._send(422, {"error": "text must be 1-4000 characters"})
+            now = datetime.now(timezone.utc).isoformat()
+            cur = db().execute(
+                "INSERT INTO hotline_messages (sender, body, created_at) VALUES (?, ?, ?)",
+                (sender, text.strip(), now),
+            )
+            db().commit()
+            return self._send(201, {"id": cur.lastrowid, "ts": now})
+        if m == "GET" and rest == "messages":
+            try:
+                since = int(q.get("since", ["0"])[0])
+            except (ValueError, IndexError):
+                since = 0
+            try:
+                limit = min(int(q.get("limit", ["50"])[0]), 200)
+            except (ValueError, IndexError):
+                limit = 50
+            rows = db().execute(
+                "SELECT id, sender, body, created_at FROM hotline_messages WHERE id > ? ORDER BY id ASC LIMIT ?",
+                (since, limit),
+            ).fetchall()
+            msgs = [{"id": r["id"], "sender": r["sender"], "text": r["body"], "ts": r["created_at"]} for r in rows]
+            return self._send(200, {"messages": msgs})
         return self._send(404, {"error": "not found"})
 
     do_GET = lambda self: self._route()
