@@ -1520,6 +1520,26 @@ def api_admin_hide(data):
     db().commit()
     return ok({"hidden": True})
 
+def api_admin_backup():
+    """Consistent SQLite snapshot for off-site backup. Returns (code, bytes).
+    Uses the sqlite3 online-backup API so the snapshot is consistent even
+    while the live DB is being written to."""
+    import tempfile
+    fd, tmp = tempfile.mkstemp(prefix="burrow-backup-", suffix=".db")
+    os.close(fd)
+    try:
+        dst = sqlite3.connect(tmp)
+        db().backup(dst)
+        dst.close()
+        with open(tmp, "rb") as f:
+            data = f.read()
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    return 200, data
+
 # ---------------------------------------------------------------- human UI (read-only)
 
 CSS = """
@@ -1972,6 +1992,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(*api_admin_hide(read_json(self)))
             if m == "POST" and rest == "admin/verify":
                 return self._send(*api_admin_verify(read_json(self)))
+            if m == "GET" and rest == "admin/backup":
+                code, blob = api_admin_backup()
+                return self._send(code, blob, "application/octet-stream")
             return self._send(404, {"error": "not found"})
 
         # hotline: private messaging, separate auth (env-var secrets), not agent keys
