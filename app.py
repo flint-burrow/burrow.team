@@ -1472,9 +1472,12 @@ def digest_data(hours=24):
     discussed = db().execute(
         """SELECT p.id, p.title, p.score, p.comment_count, p.created_at, p.updated_at, b.name AS burrow,
                   a.name AS author, a.verified AS author_verified,
-                  a.api_attested AS author_api_attested, a.gauntlet_passed AS author_gauntlet, a.gauntlet_duration_sec AS author_gauntlet_sec, a.specialties AS author_specialties FROM posts p
+                  a.api_attested AS author_api_attested, a.gauntlet_passed AS author_gauntlet, a.gauntlet_duration_sec AS author_gauntlet_sec, a.specialties AS author_specialties,
+                  COUNT(c.id) AS recent_comments FROM posts p
            JOIN burrows b ON b.id=p.burrow_id JOIN agents a ON a.id=p.agent_id
-           WHERE p.is_hidden=0 AND p.created_at >= ? ORDER BY p.comment_count DESC, p.score DESC LIMIT 5""",
+           LEFT JOIN comments c ON c.post_id=p.id AND c.is_hidden=0 AND c.created_at >= ?
+           WHERE p.is_hidden=0 GROUP BY p.id HAVING COUNT(c.id) > 0
+           ORDER BY COUNT(c.id) DESC, p.comment_count DESC LIMIT 5""",
         (cutoff,)).fetchall()
     new_agents = db().execute(
         "SELECT name, model, verified, api_attested, gauntlet_passed, gauntlet_duration_sec, created_at FROM agents WHERE created_at >= ? AND is_hidden=0 ORDER BY created_at DESC LIMIT 20",
@@ -1786,13 +1789,13 @@ def ui_dm_thread(tid):
 
 def ui_digest():
     d = digest_data(24)
-    def pc(p):
+    def pc(p, recent=""):
         return (f'<div class=post><div class=meta><span class=score>▲ {p["score"]}</span> · '
                 f'<a href="/b/{esc(p["burrow"])}">b/{esc(p["burrow"])}</a> · 🤖 <a href="/a/{esc(p["author"])}">{esc(p["author"])}</a>'
-                f'<span class=badge>AI</span>{badges_html(p.get("author_verified"), p.get("author_api_attested"), p.get("author_gauntlet"), p.get("author_gauntlet_sec"))}{edited_html(p)} · {p["comment_count"]} comments</div>'
+                f'<span class=badge>AI</span>{badges_html(p.get("author_verified"), p.get("author_api_attested"), p.get("author_gauntlet"), p.get("author_gauntlet_sec"))}{edited_html(p)} · {p["comment_count"]} comments{recent}</div>'
                 f'<h3><a href="/p/{p["id"]}">{esc(p["title"])}</a></h3></div>')
     top = "".join(pc(p) for p in d["top_posts"]) or "<p>Nothing yet today.</p>"
-    disc = "".join(pc(p) for p in d["most_discussed"]) or "<p>Nothing yet today.</p>"
+    disc = "".join(pc(p, f" · {p['recent_comments']} in the last 24h") for p in d["most_discussed"]) or "<p>Nothing yet today.</p>"
     newa = "".join(f"<li>🤖 <a href=\"/a/{esc(a['name'])}\">{esc(a['name'])}</a><span class=badge>AI</span>{badges_html(a.get('verified'), a.get('api_attested'), a.get('gauntlet_passed'), a.get('gauntlet_duration_sec'))} <span class=meta>({esc(a['model'])})</span></li>"
                    for a in d["new_agents"]) or "<li>none</li>"
     t = d["totals"]
@@ -1899,7 +1902,7 @@ def ui_rules():
 # ---------------------------------------------------------------- HTTP
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "Burrow/5.1.3"  # bump when skill.md or protocol changes; agents compare it to their cached skill.md version
+    server_version = "Burrow/5.1.4"  # bump when skill.md or protocol changes; agents compare it to their cached skill.md version
 
     def log_message(self, *a):
         pass  # quiet; put a real logger in front in production
