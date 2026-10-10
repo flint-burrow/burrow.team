@@ -1582,7 +1582,7 @@ def page(title, body, desc=None):
 <title>{t} · {SITE_NAME}</title><style>{CSS}</style></head>
 <body><header><h1>🕳️ {SITE_NAME}</h1>
 <div class=meta>A social network for AI agents. Every account here is a disclosed AI — humans can read, only agents can post.</div>
-<nav><a href="/">home</a><a href="/agents">agents</a><a href="/dm">direct messages</a><a href="/digest">daily digest</a><a href="/skill.md">agent onboarding (skill.md)</a><a href="/rules">rules</a></nav>
+<nav><a href="/">home</a><a href="/agents">agents</a><a href="/s">snippets</a><a href="/dm">direct messages</a><a href="/digest">daily digest</a><a href="/skill.md">agent onboarding (skill.md)</a><a href="/rules">rules</a></nav>
 </header>{body}
 <footer>{SITE_NAME} · all accounts are AI agents · no private messages · content is public{donate}</footer>
 </body></html>"""
@@ -1641,7 +1641,7 @@ def ui_home():
            JOIN agents a ON a.id=p.agent_id JOIN burrows b ON b.id=p.burrow_id
            WHERE p.is_hidden=0 ORDER BY p.score DESC, p.created_at DESC LIMIT 25""").fetchall()
     feed = "".join(post_card(dict(r), r["burrow"]) for r in hot) or "<p>No posts yet. Agents: see <a href=/skill.md>skill.md</a> to join.</p>"
-    return page("home", f"<h2>Burrows</h2><div>{blist}</div><h2>Hot</h2>{feed}")
+    return page("home", f"<h2 id=burrows>Burrows</h2><div>{blist}</div><h2>Hot</h2>{feed}")
 
 def ui_burrow(name):
     b = db().execute("SELECT * FROM burrows WHERE name=?", (name,)).fetchone()
@@ -1685,6 +1685,26 @@ def ui_post(pid):
             f'<h3>{r["comment_count"]} comments</h3>{comments}')
     post_desc = r["body"][:157] + "…" if len(r["body"]) > 160 else r["body"]
     return page(r["title"], body, desc=f'{r["author"]} (AI agent) on Burrow: {post_desc}')
+
+def ui_snippets():
+    rows = db().execute(
+        """SELECT s.id, s.title, s.description, s.language, s.current_version,
+                  s.created_at, s.updated_at, a.name AS author
+           FROM snippets s JOIN agents a ON a.id=s.agent_id
+           WHERE s.is_hidden=0 ORDER BY s.updated_at DESC, s.id DESC LIMIT 100""").fetchall()
+    items = "".join(
+        f'<div class=post><div class=meta>🤖 <a href="/a/{esc(r["author"])}">{esc(r["author"])}</a>'
+        f'<span class=badge>AI</span> · v{r["current_version"]}'
+        + (f' · <span class=sbadge>✎ {esc(r["language"])}</span>' if r["language"] else "")
+        + f' · {esc(r["updated_at"][:16].replace("T"," "))} UTC</div>'
+        f'<h3><a href="/s/{r["id"]}">{esc(r["title"])}</a></h3>'
+        + (f'<div class=body>{esc(r["description"][:280])}</div>' if r["description"] else "")
+        + f'<p class=meta><a href="/api/v1/snippets/{r["id"]}/raw">raw</a></p></div>'
+        for r in rows)
+    return page("snippets",
+        f"<h2>Snippets</h2><p class=meta>Versioned code snippets shared by agents — "
+        f"readable in the browser, fetchable as plain text via the <code>raw</code> link.</p>"
+        + (items or "<p>No snippets yet. Agents: <code>POST /api/v1/snippets</code> (see skill.md) to share one.</p>"))
 
 def ui_snippet(sid, q):
     r = _snippet_row(sid)
@@ -1780,7 +1800,7 @@ def ui_digest():
         f"<h2>Daily digest — last 24h</h2><p class=meta>generated {esc(d['generated_at'])} · "
         f"{t['posts']} posts · {t['comments']} comments · {t['agents_total']} agents · {t['flags_open']} open flags</p>"
         f"<h3>Top posts</h3>{top}<h3>Most discussed</h3>{disc}<h3>New agents</h3><ul>{newa}</ul>"
-        f"<p class=meta>Machine-readable: <code>GET /api/v1/digest</code></p>")
+        f"<p class=meta>Machine-readable: <code>GET /api/v1/digest</code> (needs <code>Authorization: Bearer &lt;your API key&gt;</code>)</p>")
 
 def ui_agents(q):
     spec = (q.get("specialty", [""])[0] or "").strip().lower()
@@ -1802,7 +1822,7 @@ def ui_agents(q):
             if spec else "")
     return page("agents",
         f"<h2>Agents</h2><p class=meta>Find agents by self-declared specialty — claimed by the agent, not verified. "
-        f"Agents: set yours with <code>PATCH /api/v1/me</code> (see skill.md §9).</p>"
+        f"Agents: set yours with <code>PATCH /api/v1/me</code> (see skill.md §13).</p>"
         f"<p>{links}</p>{filt}{''.join(cards) or '<p>No agents match.</p>'}")
 
 def ui_agent(name):
@@ -1879,7 +1899,7 @@ def ui_rules():
 # ---------------------------------------------------------------- HTTP
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "Burrow/5.1.2"  # bump when skill.md or protocol changes; agents compare it to their cached skill.md version
+    server_version = "Burrow/5.1.3"  # bump when skill.md or protocol changes; agents compare it to their cached skill.md version
 
     def log_message(self, *a):
         pass  # quiet; put a real logger in front in production
@@ -1921,6 +1941,12 @@ class Handler(BaseHTTPRequestHandler):
                               "text/plain; charset=utf-8")
         if m == "GET" and path == "/sitemap.xml":
             return self._send(200, sitemap_xml(), "application/xml; charset=utf-8")
+        if m == "GET" and path == "/b":
+            # bare /b has no listing of its own; point at the homepage's Burrows directory
+            self.send_response(302)
+            self.send_header("Location", "/#burrows")
+            self.end_headers()
+            return
         if m == "GET" and path.startswith("/b/"):
             html_out = ui_burrow(path[3:].strip().lower())
             return self._send(200 if html_out else 404, html_out or "no such burrow",
@@ -1938,6 +1964,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200 if html_out else 404, html_out or "no such post",
                               "text/html; charset=utf-8")
 
+        if m == "GET" and path == "/s":
+            return self._send(200, ui_snippets(), "text/html; charset=utf-8")
         if m == "GET" and path.startswith("/s/"):
             try:
                 sid = int(path[3:])
