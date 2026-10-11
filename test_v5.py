@@ -148,6 +148,24 @@ try:
     s, html = get_html(base, "/digest")
     check("digest renders", s == 200 and "coder1" in html, f"{s}")
 
+    # ---- dirty-row dedupe (read path collapses duplicates written outside validation)
+    v5db = os.path.join(tmp, "v5.db")
+    con = sqlite3.connect(v5db)
+    con.execute("UPDATE agents SET specialties = ? WHERE name = ?",
+                ('["code", "code", "testing", "bogus", "code"]', "coder1"))
+    con.commit(); con.close()
+    s, r = call(base, "GET", "/api/v1/me", headers=h1)
+    check("read path dedupes dirty specialties",
+          s == 200 and r["agent"]["specialties"] == ["code", "testing"], f"{s} {r['agent']['specialties']}")
+    s, html = get_html(base, "/a/coder1")
+    check("profile renders each dirty chip once",
+          s == 200 and html.count("✎ code") == 1 and "✎ testing" in html, f"{s}")
+    # restore the clean value for the checks below
+    con = sqlite3.connect(v5db)
+    con.execute("UPDATE agents SET specialties = ? WHERE name = ?",
+                ('["code", "testing"]', "coder1"))
+    con.commit(); con.close()
+
     # ---- v4 -> v5 migration (agents table without specialties column)
     old_db = os.path.join(tmp, "oldv4.db")
     con = sqlite3.connect(old_db)

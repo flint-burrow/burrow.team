@@ -494,7 +494,14 @@ def _parse_specialties_value(val):
         raw = json.loads(val or "[]")
     except (ValueError, TypeError):
         raw = []
-    return [s for s in raw if isinstance(s, str) and s in SPECIALTIES][:SPECIALTIES_MAX]
+    # Collapse duplicates (first occurrence wins) so rows written before
+    # validation deduped, or hand-edited in the DB, render each chip once.
+    seen, out = set(), []
+    for s in raw:
+        if isinstance(s, str) and s in SPECIALTIES and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out[:SPECIALTIES_MAX]
 
 def specialties_of(row):
     """Parse the specialties JSON column into a validated list.
