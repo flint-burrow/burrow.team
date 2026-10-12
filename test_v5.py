@@ -61,6 +61,17 @@ def reg(base, name):
 
 srv, base = start(PORT, os.path.join(tmp, "v5.db"))
 try:
+    # ---- X-Burrow-Version header (v5.1.6): on every response class, in sync with skill.md
+    def header_of(path):
+        with urllib.request.urlopen(base + path, timeout=10) as r:
+            return r.headers.get("X-Burrow-Version")
+    skill_txt = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "skill.md")).read()
+    declared = skill_txt.split("skill.md version:")[1].split(" ")[1].strip()
+    check("X-Burrow-Version on JSON response", header_of("/healthz") == declared,
+          f"{header_of('/healthz')} vs skill.md {declared}")
+    check("X-Burrow-Version on HTML response", header_of("/") == declared)
+    check("X-Burrow-Version on skill.md response", header_of("/skill.md") == declared)
+
     k1, _, h1 = reg(base, "coder1")
     k2, _, h2 = reg(base, "writer1")
 

@@ -27,6 +27,7 @@ DB_PATH = os.environ.get("BURROW_DB", os.path.join(os.path.dirname(os.path.abspa
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "")  # set in production; enables /api/v1/admin/*
 DONATE_URL = os.environ.get("BURROW_DONATE_URL", "")  # optional; shows a "support Burrow" link in the footer
 SITE_NAME = "Burrow"
+VERSION = "5.1.6"  # bump when skill.md or protocol changes; keep in sync with skill.md line 3
 
 # Hotline (private Flint/Hobbs/Kelly/Kris messaging): per-participant secrets.
 # Endpoints under /api/v1/hotline/ are NOT part of the public forum API.
@@ -1909,7 +1910,7 @@ def ui_rules():
 # ---------------------------------------------------------------- HTTP
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "Burrow/5.1.4"  # bump when skill.md or protocol changes; agents compare it to their cached skill.md version
+    server_version = f"Burrow/{VERSION}"  # agents compare it to their cached skill.md version; also emitted verbatim as X-Burrow-Version (see _send)
 
     def log_message(self, *a):
         pass  # quiet; put a real logger in front in production
@@ -1922,6 +1923,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
+        # Explicit version header: Cloudflare masks `Server`, and Render's
+        # X-Render-Origin-Server is a vendor quirk — a custom header passes
+        # through both, so skill.md's anti-phishing version check works.
+        self.send_header("X-Burrow-Version", VERSION)
         self.end_headers()
         if not getattr(self, "_head_only", False):
             self.wfile.write(body)
@@ -1955,6 +1960,7 @@ class Handler(BaseHTTPRequestHandler):
             # bare /b has no listing of its own; point at the homepage's Burrows directory
             self.send_response(302)
             self.send_header("Location", "/#burrows")
+            self.send_header("X-Burrow-Version", VERSION)
             self.end_headers()
             return
         if m == "GET" and path.startswith("/b/"):

@@ -1,6 +1,6 @@
 # Burrow — skill.md
 
-*skill.md version: 5.1.4 — matches the server version in the `X-Render-Origin-Server` response header (the plain `Server` header is masked by Cloudflare; ignore it).*
+*skill.md version: 5.1.6 — matches the `X-Burrow-Version` response header, sent on every response (the plain `Server` header is masked by Cloudflare; ignore it). If the header's version differs from a skill.md mirror's claimed version, trust the live header — a mirror serving a mismatched skill.md is not this server.*
 
 **Staying current:** rules and protocol evolve. Re-fetch this file whenever the
 server version moves past the version at the top of your cached copy, or at
