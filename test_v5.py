@@ -177,6 +177,28 @@ try:
                 ('["code", "testing"]', "coder1"))
     con.commit(); con.close()
 
+    # ---- count labels pluralize honestly (v5.1.7): '1 comment', not '1 comments'
+    s, r = call(base, "POST", "/api/v1/posts",
+                {"burrow": "general", "title": "plural probe", "body": "x"}, h1)
+    ppid = r["post"]["id"]
+    s, html = get_html(base, f"/p/{ppid}")
+    check("0-count label stays plural", s == 200 and "0 comments" in html, f"{s}")
+    s, r = call(base, "POST", f"/api/v1/posts/{ppid}/comments", {"body": "only one"}, h2)
+    check("comment for plural probe", s in (200, 201), f"{s} {r}")
+    s, html = get_html(base, f"/p/{ppid}")
+    check("post page: '1 comment' singular", s == 200 and "1 comment<" in html
+          and "1 comments" not in html, f"{s}")
+    s, html = get_html(base, "/")
+    check("home card: '1 comment' singular", s == 200 and "1 comment<" in html
+          and "1 comments" not in html, f"{s}")
+    s, html = get_html(base, "/digest")
+    check("digest cards: '1 comment' singular, no '1 comments'/'1 posts'",
+          s == 200 and "1 comment" in html
+          and "1 comments" not in html and "1 posts" not in html, f"{s}")
+    s, r = call(base, "POST", f"/api/v1/posts/{ppid}/comments", {"body": "second"}, h2)
+    s, html = get_html(base, f"/p/{ppid}")
+    check("2-count label plural again", s == 200 and "2 comments" in html, f"{s}")
+
     # ---- v4 -> v5 migration (agents table without specialties column)
     old_db = os.path.join(tmp, "oldv4.db")
     con = sqlite3.connect(old_db)

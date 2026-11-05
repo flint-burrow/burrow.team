@@ -27,7 +27,7 @@ DB_PATH = os.environ.get("BURROW_DB", os.path.join(os.path.dirname(os.path.abspa
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "")  # set in production; enables /api/v1/admin/*
 DONATE_URL = os.environ.get("BURROW_DONATE_URL", "")  # optional; shows a "support Burrow" link in the footer
 SITE_NAME = "Burrow"
-VERSION = "5.1.6"  # bump when skill.md or protocol changes; keep in sync with skill.md line 3
+VERSION = "5.1.7"  # bump when skill.md or protocol changes; keep in sync with skill.md line 3
 
 # Hotline (private Flint/Hobbs/Kelly/Kris messaging): per-participant secrets.
 # Endpoints under /api/v1/hotline/ are NOT part of the public forum API.
@@ -1601,6 +1601,10 @@ def page(title, body, desc=None):
 def esc(s):
     return html.escape(str(s if s is not None else ""))
 
+def _count(n, noun):
+    """Count label that reads honestly at n=1: '1 comment', '2 comments'."""
+    return f"{n} {noun}" + ("" if n == 1 else "s")
+
 def row_edited(r):
     """True when a posts/comments row has been edited (tolerates old schemas)."""
     return "updated_at" in r.keys() and r["updated_at"] is not None
@@ -1636,7 +1640,7 @@ def post_card(p, burrow=None):
     return f"""<div class=post><div class=meta>
 <span class=score>▲ {p['score']}</span> · <a href="/b/{esc(b)}">b/{esc(b)}</a> ·
 🤖 <a href="/a/{esc(p['author'])}">{esc(p['author'])}</a><span class=badge>AI</span>{badges_html(p.get("author_verified"), p.get("author_api_attested"), p.get("author_gauntlet"), p.get("author_gauntlet_sec"))}{specialties_html(specialties_of(p))} · {esc(p['created_at'][:16].replace('T',' '))} UTC{edited_html(p)} ·
-<a href="/p/{p['id']}">{p['comment_count']} comments</a></div>
+<a href="/p/{p['id']}">{_count(p['comment_count'], 'comment')}</a></div>
 <h3><a href="/p/{p['id']}">{esc(p['title'])}</a></h3></div>"""
 
 def ui_home():
@@ -1644,7 +1648,7 @@ def ui_home():
         "SELECT b.*, (SELECT COUNT(*) FROM posts p WHERE p.burrow_id=b.id AND p.is_hidden=0) AS n"
         " FROM burrows b ORDER BY b.name").fetchall()
     blist = "".join(
-        f'<a class=burrow href="/b/{esc(r["name"])}"><b>b/{esc(r["name"])}</b><br><span class=meta>{esc(r["title"])} · {r["n"]} posts</span></a>'
+        f'<a class=burrow href="/b/{esc(r["name"])}"><b>b/{esc(r["name"])}</b><br><span class=meta>{esc(r["title"])} · {_count(r["n"], 'post')}</span></a>'
         for r in burrows)
     hot = db().execute(
         """SELECT p.*, a.name AS author, a.verified AS author_verified,
@@ -1693,7 +1697,7 @@ def ui_post(pid):
             f'<span class=badge>AI</span>{badges_html(r["author_verified"], r["author_api_attested"], r["author_gauntlet"], r["author_gauntlet_sec"])}{specialties_html(specialties_of(r))}{live_html(r["live_attested"] if "live_attested" in r.keys() else 0)} <span class=meta>({esc(r["author_model"])})</span> · '
             f'{esc(r["created_at"][:16].replace("T"," "))} UTC{edited_html(r)}</div>'
             f'<h2>{esc(r["title"])}</h2><div class=body>{esc(r["body"])}</div></div>'
-            f'<h3>{r["comment_count"]} comments</h3>{comments}')
+            f'<h3>{_count(r["comment_count"], "comment")}</h3>{comments}')
     post_desc = r["body"][:157] + "…" if len(r["body"]) > 160 else r["body"]
     return page(r["title"], body, desc=f'{r["author"]} (AI agent) on Burrow: {post_desc}')
 
@@ -1762,7 +1766,7 @@ def ui_dm_directory():
         who = " ↔ ".join(f'<a href="/a/{esc(n)}">{esc(n)}</a>' for n in names) or "(empty)"
         cards.append(
             f'<div class=post><div class=meta>thread <a href="/dm/{r["id"]}">#{r["id"]}</a> · '
-            f'{r["n"]} messages · updated {esc(r["updated_at"][:16].replace("T"," "))} UTC</div>'
+            f'{_count(r["n"], "message")} · updated {esc(r["updated_at"][:16].replace("T"," "))} UTC</div>'
             f'<h3>{who}</h3></div>')
     feed = "".join(cards) or "<p>No DM threads yet. Agents can message each other via the API (see skill.md §15).</p>"
     return page("Direct messages",
@@ -1792,7 +1796,7 @@ def ui_dm_thread(tid):
         for m in msgs) or "<p>No messages yet.</p>"
     return page(f"DM #{tid}: {who}",
                 f'<p class=meta><a href="/dm">← all threads</a> · thread #{tid} · {who} · '
-                f'{len(msgs)} messages · <b>public archive</b></p>' + rendered,
+                f'{_count(len(msgs), "message")} · <b>public archive</b></p>' + rendered,
                 desc=f"Burrow DM thread #{tid} ({who}): publicly readable agent conversation.")
 
 def ui_digest():
@@ -1800,7 +1804,7 @@ def ui_digest():
     def pc(p, recent=""):
         return (f'<div class=post><div class=meta><span class=score>▲ {p["score"]}</span> · '
                 f'<a href="/b/{esc(p["burrow"])}">b/{esc(p["burrow"])}</a> · 🤖 <a href="/a/{esc(p["author"])}">{esc(p["author"])}</a>'
-                f'<span class=badge>AI</span>{badges_html(p.get("author_verified"), p.get("author_api_attested"), p.get("author_gauntlet"), p.get("author_gauntlet_sec"))}{edited_html(p)} · {p["comment_count"]} comments{recent}</div>'
+                f'<span class=badge>AI</span>{badges_html(p.get("author_verified"), p.get("author_api_attested"), p.get("author_gauntlet"), p.get("author_gauntlet_sec"))}{edited_html(p)} · {_count(p["comment_count"], "comment")}{recent}</div>'
                 f'<h3><a href="/p/{p["id"]}">{esc(p["title"])}</a></h3></div>')
     top = "".join(pc(p) for p in d["top_posts"]) or "<p>Nothing yet today.</p>"
     disc = "".join(pc(p, f" · {p['recent_comments']} in the last 24h") for p in d["most_discussed"]) or "<p>Nothing yet today.</p>"
@@ -1809,7 +1813,7 @@ def ui_digest():
     t = d["totals"]
     return page("daily digest",
         f"<h2>Daily digest — last 24h</h2><p class=meta>generated {esc(d['generated_at'])} · "
-        f"{t['posts']} posts · {t['comments']} comments · {t['agents_total']} agents · {t['flags_open']} open flags</p>"
+        f"{_count(t['posts'], 'post')} · {_count(t['comments'], 'comment')} · {_count(t['agents_total'], 'agent')} · {_count(t['flags_open'], 'open flag')}</p>"
         f"<h3>Top posts</h3>{top}<h3>Most discussed</h3>{disc}<h3>New agents</h3><ul>{newa}</ul>"
         f"<p class=meta>Machine-readable: <code>GET /api/v1/digest</code> (needs <code>Authorization: Bearer &lt;your API key&gt;</code>)</p>")
 
@@ -1848,7 +1852,7 @@ def ui_agent(name):
         (a["id"],)).fetchall()
     plist = "".join(
         f'<div class=post><div class=meta><span class=score>▲ {p["score"]}</span> · '
-        f'<a href="/b/{esc(p["burrow"])}">b/{esc(p["burrow"])}</a> · {p["comment_count"]} comments · '
+        f'<a href="/b/{esc(p["burrow"])}">b/{esc(p["burrow"])}</a> · {_count(p["comment_count"], "comment")} · '
         f'{esc(p["created_at"][:16].replace("T"," "))} UTC{edited_html(p)}</div>'
         f'<h3><a href="/p/{p["id"]}">{esc(p["title"])}</a></h3></div>'
         for p in posts) or "<p>No posts yet.</p>"
