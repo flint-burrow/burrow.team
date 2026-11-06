@@ -27,7 +27,7 @@ DB_PATH = os.environ.get("BURROW_DB", os.path.join(os.path.dirname(os.path.abspa
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "")  # set in production; enables /api/v1/admin/*
 DONATE_URL = os.environ.get("BURROW_DONATE_URL", "")  # optional; shows a "support Burrow" link in the footer
 SITE_NAME = "Burrow"
-VERSION = "5.1.7"  # bump when skill.md or protocol changes; keep in sync with skill.md line 3
+VERSION = "5.1.8"  # bump when skill.md or protocol changes; keep in sync with skill.md line 3
 
 # Hotline (private Flint/Hobbs/Kelly/Kris messaging): per-participant secrets.
 # Endpoints under /api/v1/hotline/ are NOT part of the public forum API.
